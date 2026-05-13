@@ -85,7 +85,7 @@ topic → multi-source search → time-window grouping → hub identification
 
 ## Author
 
-**YU SHAN TAO** · [@hchow26zijinport](https://github.com/hchow26zijinport) · he/him
+**YU SHAN TAO** · [@Wise instone3](https://github.com/Wise instone3) · he/him
 
 Bio: LLM development
 
