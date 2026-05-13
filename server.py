@@ -1,6 +1,7 @@
-"""MCP server for Literature Evolution Explorer.
+"""MCP server for LEExtractor — Systematic Literature Review Toolkit.
 
-Exposes tools for research topic evolution exploration and PDF download.
+Exposes tools for the 4-phase review workflow:
+Scoping → Systematic Search → Snowballing → PRISMA → PDF Download.
 
 Usage:
     python server.py
@@ -13,94 +14,259 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from fastmcp import FastMCP
+from litsearch.prisma import ScreeningDecision
 
 mcp = FastMCP(
-    "Literature Evolution Explorer",
-    description="Research topic evolution path discovery with PDF download",
+    "LEExtractor — Literature Review",
+    description="Systematic literature review with PRISMA + TARCiS methodology",
 )
+
+# In-memory state per session
+_active_states: dict[str, object] = {}
+
+
+def _get_or_create_workflow():
+    from litsearch.search import LiteratureReviewWorkflow
+    session_id = "default"
+    workflow = LiteratureReviewWorkflow()
+    return workflow, session_id
 
 
 # ---------------------------------------------------------------------------
-# Tool: evolution_search
+# Tool: literature_review_search
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-def evolution_search(
+def literature_review_search(
     topic: str,
-    mode: str = "fast",
+    research_direction: str = "",
     years_back: int = 20,
     max_papers: int = 200,
+    snowball_rounds: int = 2,
+    auto_screen: bool = True,
 ) -> dict:
-    """
-    Explore the knowledge evolution path of a research topic.
+    """Run the complete 4-phase systematic literature review workflow.
 
-    Discovers how ideas evolved over time by analyzing citation patterns
-    and extracting the backbone evolution chain (e.g., ML→CNN→RNN→Transformer→LLM).
+    Phases:
+    1. Scoping — field landscape (topic clusters, key journals/authors)
+    2. Systematic Search — multi-database search (S2 + OpenAlex + arXiv + Crossref)
+    3. Snowballing — TARCiS-aligned forward+backward citation tracing
+    4. PRISMA Report — screening + PRISMA 2020 flow diagram
 
-    Use this when you need to: understand how a research field developed,
-    find key papers at each stage of evolution, discover paradigm shifts.
+    Use this when you need to: write a literature review, understand a research
+    field's evolution, find key papers for a systematic review.
 
     Args:
         topic: Research topic or keywords.
-        mode: "fast" (quick overview, ~100 papers) or "comprehensive"
-              (deep analysis, ~500 papers).
-        years_back: How many years back to search.
-        max_papers: Maximum papers to analyze.
+        research_direction: Focus description for relevance scoring.
+        years_back: How many years of literature to cover.
+        max_papers: Maximum papers for systematic search phase.
+        snowball_rounds: Iterations of citation tracing (1-5).
+        auto_screen: If True, auto-screen by relevance >= 0.15 threshold.
 
     Returns:
-        Evolution path with eras, hub papers, and download URLs.
+        Complete review results with scoping, search, snowballing, PRISMA data,
+        and included papers with download URLs.
     """
-    from litsearch.search import LiteratureExplorer
+    from litsearch.search import LiteratureReviewWorkflow
 
-    explorer = LiteratureExplorer()
+    workflow = LiteratureReviewWorkflow()
 
-    if mode == "fast":
-        path = explorer.fast_search(topic, years_back=years_back, max_papers=max_papers)
+    if auto_screen:
+        state = workflow.run_full_workflow(
+            topic=topic,
+            research_direction=research_direction or topic,
+            years_back=years_back,
+            max_search_papers=max_papers,
+            snowball_rounds=snowball_rounds,
+        )
     else:
-        path = explorer.comprehensive_search(topic, years_back=years_back, max_papers=max_papers)
+        state = workflow.scope_topic(topic, research_direction or topic, years_back)
+        workflow.systematic_search(state, max_papers=max_papers, years_back=years_back)
+        workflow.run_snowballing(state, max_rounds=snowball_rounds)
+        workflow.find_similar(state)
 
-    eras_out = []
-    for era in path.eras:
-        hubs = []
-        for p in era.key_papers:
-            dl_url = p.url if p.url and p.url.startswith("http") else None
-            hubs.append({
-                "title": p.title,
-                "year": p.year,
-                "venue": p.venue,
-                "doi": p.doi,
-                "citation_count": p.citation_count,
-                "is_preprint": p.source == "arxiv",
-                "download_url": dl_url,
-                "authors": [a.name for a in p.authors[:3]],
-                "abstract_snippet": (p.abstract or "")[:300],
-            })
-        eras_out.append({
-            "era": era.era_label,
-            "start_year": era.start_year,
-            "end_year": era.end_year,
-            "total_papers": era.total_papers,
-            "keywords": era.keywords,
-            "hub_papers": hubs,
-        })
+    report = workflow.generate_prisma_report(state)
+    flow = report.to_flow_dict()
 
-    links_out = []
-    for link in path.links:
-        links_out.append({
-            "from_era": link.from_era,
-            "to_era": link.to_era,
-            "description": link.description or "",
-            "citation_count": link.citation_count,
+    included = workflow.get_included_papers(state)
+    included_out = []
+    for p in included[:50]:
+        dl = workflow.downloader.get_download_url(p)
+        included_out.append({
+            "title": p.title,
+            "year": p.year,
+            "doi": p.doi,
+            "venue": p.venue,
+            "citation_count": p.citation_count,
+            "relevance_score": round(p.relevance_score, 4),
+            "download_url": dl,
+            "authors": [a.name for a in p.authors[:3]],
+            "abstract": (p.abstract or "")[:300],
         })
 
     return {
-        "topic": path.topic,
-        "mode": path.coverage,
-        "eras": eras_out,
-        "evolution_links": links_out,
-        "total_papers_analyzed": path.total_papers_analyzed,
-        "tip": "Use download_paper(doi) to download a specific paper PDF.",
+        "topic": topic,
+        "research_direction": research_direction or topic,
+        "phases_completed": state.phase.value,
+        "prisma_flow": flow,
+        "scoping": {
+            "topic_clusters": {
+                k: v for k, v in list(state.topic_clusters.items())[:6]
+            },
+            "key_journals": state.key_journals[:10],
+            "key_authors": state.key_authors[:10],
+            "year_range": (
+                f"{min(state.year_distribution.keys())}-{max(state.year_distribution.keys())}"
+                if state.year_distribution else "N/A"
+            ),
+        },
+        "included_papers": included_out,
+        "total_tracked": report.records_after_dedup,
+        "total_screened": report.records_screened,
+        "total_included": report.studies_included,
+        "download_dir": workflow.downloader.get_download_dir(),
+        "tip": "Use snowball_from_seeds() to expand from specific papers, or download_paper() to get PDFs.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: snowball_from_seeds
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def snowball_from_seeds(
+    paper_dois: list[str],
+    research_direction: str = "",
+    max_rounds: int = 3,
+    max_per_direction: int = 50,
+) -> dict:
+    """Run forward+backward snowballing from a list of seed paper DOIs.
+
+    Implements the TARCiS methodology: iteratively trace references (backward)
+    and citations (forward) until saturation.
+
+    Args:
+        paper_dois: List of DOIs to use as seeds.
+        research_direction: Focus description for relevance scoring.
+        max_rounds: Maximum snowball iterations.
+        max_per_direction: Max papers to fetch per seed per direction.
+
+    Returns:
+        Snowballing rounds and discovered papers.
+    """
+    from litsearch.sources import SourceManager
+    from litsearch.filters import RelevanceFilter
+    from litsearch.snowball import SnowballEngine
+
+    sources = SourceManager()
+    filters = RelevanceFilter()
+
+    seeds = []
+    for doi in paper_dois:
+        paper = sources.resolve_doi(doi.strip())
+        if paper:
+            seeds.append(paper)
+
+    if not seeds:
+        return {"error": "No valid seed papers found from provided DOIs"}
+
+    engine = SnowballEngine(sources=sources, filters=filters)
+    result = engine.run(
+        seed_papers=seeds,
+        research_direction=research_direction,
+        max_rounds=max_rounds,
+        max_per_direction=max_per_direction,
+    )
+
+    rounds_out = []
+    for rnd in result.rounds:
+        rounds_out.append({
+            "round": rnd.round_number,
+            "new_papers_count": rnd.count,
+            "new_papers": [
+                {
+                    "title": p.title,
+                    "year": p.year,
+                    "doi": p.doi,
+                    "citation_count": p.citation_count,
+                    "relevance_score": round(p.relevance_score, 4),
+                }
+                for p in rnd.new_papers[:15]
+            ],
+        })
+
+    return {
+        "seed_papers": [s.title[:100] for s in seeds],
+        "total_rounds": len(result.rounds),
+        "total_discovered": result.total_discovered,
+        "saturated": result.saturated,
+        "saturation_reason": result.saturation_reason,
+        "rounds": rounds_out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: find_similar_papers
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def find_similar_papers(
+    paper_dois: list[str],
+    top_k: int = 20,
+) -> dict:
+    """Find similar papers via bibliographic coupling and co-citation analysis.
+
+    Two methods are combined:
+    1. Bibliographic coupling — papers that share references with your seeds
+    2. Co-citation — papers frequently cited alongside your seeds
+
+    Args:
+        paper_dois: List of seed paper DOIs.
+        top_k: Maximum number of similar papers to return.
+
+    Returns:
+        List of similar papers with similarity scores and discovery method.
+    """
+    from litsearch.sources import SourceManager
+    from litsearch.similar import SimilarPaperFinder
+
+    sources = SourceManager()
+
+    seeds = []
+    for doi in paper_dois:
+        paper = sources.resolve_doi(doi.strip())
+        if paper:
+            seeds.append(paper)
+
+    if not seeds:
+        return {"error": "No valid seed papers found from provided DOIs"}
+
+    finder = SimilarPaperFinder(sources=sources)
+    results = finder.find_similar(seeds, top_k=top_k)
+
+    out = []
+    for paper, score, method in results:
+        out.append({
+            "title": paper.title,
+            "year": paper.year,
+            "doi": paper.doi,
+            "venue": paper.venue,
+            "citation_count": paper.citation_count,
+            "similarity_score": round(score, 4),
+            "method": method,
+            "authors": [a.name for a in paper.authors[:3]],
+        })
+
+    return {
+        "seed_papers": [s.title[:100] for s in seeds],
+        "similar_papers": out,
+        "total_found": len(out),
+        "by_bibliographic_coupling": sum(1 for _, _, m in results if m == "bibliographic_coupling"),
+        "by_cocitation": sum(1 for _, _, m in results if m == "co_citation"),
     }
 
 
@@ -111,8 +277,7 @@ def evolution_search(
 
 @mcp.tool()
 def download_paper(paper_doi_or_title: str) -> dict:
-    """
-    Download a paper PDF by DOI or title.
+    """Download a paper PDF by DOI or title.
 
     Tries multiple sources in order: OpenAccess → arXiv → Sci-Hub.
 
@@ -127,7 +292,6 @@ def download_paper(paper_doi_or_title: str) -> dict:
 
     sources = SourceManager()
 
-    # Resolve to paper
     if paper_doi_or_title.startswith("10."):
         paper = sources.resolve_doi(paper_doi_or_title)
     else:
@@ -158,8 +322,7 @@ def download_paper(paper_doi_or_title: str) -> dict:
 
 @mcp.tool()
 def batch_download(dois: list[str]) -> dict:
-    """
-    Download multiple papers by DOI list.
+    """Download multiple papers by DOI list.
 
     Args:
         dois: List of DOIs to download.
