@@ -137,7 +137,7 @@ class LiteratureExplorer:
         # Re-run link discovery with enriched references
         era_hubs = {e.era_label: e.key_papers for e in path.eras}
         all_dict = {p.id: p for e in path.eras for p in e.key_papers}
-        for p in all_dict.values():
+        for p in list(all_dict.values()):
             if p.doi:
                 all_dict[p.doi] = p
 
