@@ -1,4 +1,4 @@
-"""Literature Evolution Explorer — Streamlit GUI.
+"""LEExtractor — Literature Evolution Extractor (Streamlit GUI).
 
 Search a research topic → discover evolution paths → download key papers.
 """
@@ -25,37 +25,39 @@ st.set_page_config(
 def render_sidebar():
     st.sidebar.title("🧬 LEExtractor")
     st.sidebar.caption("Literature Evolution Extractor")
-    st.sidebar.caption("文献综述写作 · 技术脉络梳理 · PDF 下载")
+    st.sidebar.caption("文献综述写作 · 技术脉络梳理 · PDF下载")
 
     mode = st.sidebar.radio(
-        "搜索模式 Search Mode",
-        ["⚡ 快速 Fast", "🔬 全面 Comprehensive"],
+        "Search Mode / 搜索模式",
+        ["⚡ Fast / 快速", "🔬 Comprehensive / 全面"],
         index=0,
         help=(
-            "**快速**: 浅层广域搜索，快速勾勒演化主线 (~100篇)\n\n"
-            "**全面**: 多源深度搜索，完整引文挖掘，精细演化链路 (~500篇)"
+            "**Fast / 快速**: Broad shallow search, quick evolution outline (~100 papers)\n"
+            "浅层广域搜索，快速勾勒演化主线\n\n"
+            "**Comprehensive / 全面**: Deep multi-source search, full reference mining (~500 papers)\n"
+            "多源深度搜索，完整引文挖掘，精细演化链路"
         ),
     )
 
     st.sidebar.divider()
 
     years_back = st.sidebar.slider(
-        "回溯年数 Years Back",
+        "Years Back / 回溯年数",
         5, 50, 20,
-        help="搜索覆盖多少年内的文献",
+        help="How many years of literature to cover / 搜索覆盖多少年的文献",
     )
 
     max_papers = st.sidebar.slider(
-        "最大论文数 Max Papers",
+        "Max Papers / 最大论文数",
         50, 1000, 100 if "Fast" in mode else 500,
         50,
-        help="Fast 模式推荐 50-200，Comprehensive 推荐 300-800",
+        help="Fast: 50-200 recommended; Comprehensive: 300-800 recommended",
     )
 
     st.sidebar.divider()
     st.sidebar.caption(
-        "数据源: Semantic Scholar / OpenAlex / arXiv / Crossref\n"
-        "下载: Sci-Hub / arXiv / OpenAccess"
+        "Sources / 数据源: Semantic Scholar · OpenAlex · arXiv · Crossref\n"
+        "Download / 下载: Sci-Hub · arXiv · OpenAccess"
     )
 
     return mode, years_back, max_papers
@@ -70,7 +72,7 @@ def run_search(topic: str, mode: str, years_back: int, max_papers: int):
     """Execute the search and cache result in session state."""
     from litsearch.search import LiteratureExplorer
 
-    with st.spinner(f"正在分析 '{topic}' 的知识演化路径..."):
+    with st.spinner(f"Mapping evolution path for '{topic}'... / 正在分析演化路径..."):
         explorer = LiteratureExplorer()
 
         if "Fast" in mode:
@@ -101,19 +103,23 @@ def render_timeline(path):
     from litsearch.path_miner import EvolutionPath
 
     if not path.eras:
-        st.warning("未找到足够的文献来构建演化路径。请尝试更具体的主题或扩大搜索范围。")
+        st.warning(
+            "Not enough literature to build an evolution path. "
+            "Try a more specific topic or broaden the search range.\n\n"
+            "未找到足够文献构建演化路径，请尝试更具体的主题或扩大搜索范围。"
+        )
         return
 
-    st.subheader(f"📜 知识演化路径: {path.topic}")
+    st.subheader(f"📜 Evolution Path / 知识演化路径: {path.topic}")
 
     # Stats bar
     total_papers = sum(e.total_papers for e in path.eras)
     total_hubs = sum(len(e.key_papers) for e in path.eras)
     cols = st.columns(4)
-    cols[0].metric("时代窗口", f"{len(path.eras)} eras")
-    cols[1].metric("枢纽论文", f"{total_hubs} hubs")
-    cols[2].metric("分析文献", f"{total_papers}")
-    cols[3].metric("演化链接", f"{len(path.links)} links")
+    cols[0].metric("Eras / 时代窗口", f"{len(path.eras)}")
+    cols[1].metric("Hub Papers / 枢纽论文", f"{total_hubs}")
+    cols[2].metric("Papers Analyzed / 分析文献", f"{total_papers}")
+    cols[3].metric("Evolution Links / 演化链接", f"{len(path.links)}")
 
     st.divider()
 
@@ -122,17 +128,15 @@ def render_timeline(path):
     n = len(eras)
 
     for i, era in enumerate(eras):
-        # Era header
         era_col, _ = st.columns([4, 1])
         with era_col:
             st.markdown(f"### 🕐 {era.era_label}")
             st.caption(
-                f"{era.total_papers} papers in this era · "
-                f"{len(era.key_papers)} hubs · "
-                f"Keywords: {', '.join(era.keywords[:4]) if era.keywords else '—'}"
+                f"{era.total_papers} papers in this era / 该时期共 {era.total_papers} 篇 · "
+                f"{len(era.key_papers)} hubs / 枢纽论文 · "
+                f"Keywords / 关键词: {', '.join(era.keywords[:4]) if era.keywords else '—'}"
             )
 
-        # Hub papers for this era — render as cards
         _render_paper_cards(era.key_papers[:5], era.era_label)
 
         # Evolution arrow between eras
@@ -146,23 +150,24 @@ def render_timeline(path):
                 desc = link.description or f"{era.era_label} → {eras[i + 1].era_label}"
                 st.markdown(
                     f"<div style='text-align:center; padding:10px; color:#3498db; "
-                    f"font-size:1.2em'>⬇️ {desc[:120]}</div>",
+                    f"font-size:1.15em'>⬇️ {desc[:120]}</div>",
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
                     f"<div style='text-align:center; padding:10px; color:#95a5a6'>"
-                    f"⬇️  {era.era_label} → {eras[i + 1].era_label} (知识演变)</div>",
+                    f"⬇️ {era.era_label} → {eras[i + 1].era_label} "
+                    f"(conceptual shift / 知识演变)</div>",
                     unsafe_allow_html=True,
                 )
 
     # Link details in expander
     if path.links:
-        with st.expander("🔗 演化链接详情 Evolution Links"):
+        with st.expander("🔗 Evolution Links / 演化链接详情"):
             for link in path.links:
                 st.markdown(
                     f"**{link.from_era}** → **{link.to_era}**  "
-                    f"({link.citation_count} citations)  "
+                    f"({link.citation_count} citations / 引用)  "
                 )
                 if link.description:
                     st.caption(link.description)
@@ -203,18 +208,17 @@ def _render_paper_cards(papers, era_key: str):
 
                 st.markdown(
                     f"**{paper.year or '?'}** · "
-                    f"Cited: {paper.citation_count}{preprint_tag}"
+                    f"Cited / 引用: {paper.citation_count}{preprint_tag}"
                     f"{venue_extra}"
                 )
                 st.markdown(f"*{title}*")
                 st.caption(authors)
 
                 if paper.abstract:
-                    with st.expander("Abstract"):
+                    with st.expander("Abstract / 摘要"):
                         st.write(paper.abstract[:500])
 
             with c2:
-                # Download button
                 dl_url = paper.url
                 if dl_url and dl_url.startswith("http"):
                     st.link_button(
@@ -230,7 +234,6 @@ def _render_paper_cards(papers, era_key: str):
                         key=f"nodl_{era_key}_{idx}",
                     )
 
-                # DOI link
                 if paper.doi:
                     st.link_button(
                         "🔗 DOI",
@@ -242,19 +245,18 @@ def _render_paper_cards(papers, era_key: str):
 
 
 # ---------------------------------------------------------------------------
-# Download all
+# Batch download
 # ---------------------------------------------------------------------------
 
 
 def render_download_section(path, explorer):
     """Batch download section for all hub papers."""
-    st.subheader("📦 批量下载 Batch Download")
+    st.subheader("📦 Batch Download / 批量下载")
 
     all_hubs = []
     for era in path.eras:
         all_hubs.extend(era.key_papers)
 
-    # Deduplicate by DOI
     seen = set()
     unique_hubs = []
     for p in all_hubs:
@@ -264,32 +266,33 @@ def render_download_section(path, explorer):
             unique_hubs.append(p)
 
     st.info(
-        f"共 {len(unique_hubs)} 篇枢纽论文可下载。"
-        f"PDF 将保存至: `{explorer.downloader.get_download_dir()}`"
+        f"{len(unique_hubs)} hub papers available for download.\n"
+        f"PDFs saved to: `{explorer.downloader.get_download_dir()}`\n\n"
+        f"共 {len(unique_hubs)} 篇枢纽论文可下载，PDF保存至上述路径。"
     )
 
-    if st.button("📥 下载全部枢纽论文 PDF", type="primary", use_container_width=True):
+    if st.button("📥 Download All Hub PDFs / 下载全部枢纽论文", type="primary", use_container_width=True):
         progress = st.progress(0)
         status = st.empty()
 
         results = []
         for i, paper in enumerate(unique_hubs):
-            status.text(f"下载中 ({i+1}/{len(unique_hubs)}): {paper.title[:80]}...")
+            status.text(f"Downloading ({i+1}/{len(unique_hubs)}): {paper.title[:80]}...")
             path_result = explorer.downloader.download_pdf(paper)
             results.append((paper, path_result))
             progress.progress((i + 1) / len(unique_hubs))
 
         success = [r for r in results if r[1] is not None]
-        status.text(f"完成: {len(success)}/{len(unique_hubs)} 篇下载成功")
+        status.text(f"Done: {len(success)}/{len(unique_hubs)} succeeded / 下载成功")
         st.success(
-            f"下载完成! {len(success)} 篇 PDF 保存至 "
-            f"`{explorer.downloader.get_download_dir()}`"
+            f"Download complete! {len(success)} PDFs saved to "
+            f"`{explorer.downloader.get_download_dir()}`\n\n"
+            f"下载完成！{len(success)} 篇PDF已保存。"
         )
 
-        # Show failures
         failures = [r for r in results if r[1] is None]
         if failures:
-            with st.expander(f"⚠️ {len(failures)} 篇下载失败"):
+            with st.expander(f"⚠️ {len(failures)} failed / 下载失败"):
                 for p, _ in failures:
                     st.write(f"- {p.title[:100]}")
 
@@ -303,14 +306,14 @@ def main():
     st.title("🧬 LEExtractor")
     st.caption(
         "Literature Evolution Extractor — "
-        "输入研究课题 → 自动梳理技术演化脉络 → 下载关键文献 PDF"
+        "Map technology evolution paths · Download key papers\n\n"
+        "输入研究课题 → 自动梳理技术演化脉络 → 下载关键文献PDF"
     )
 
     mode, years_back, max_papers = render_sidebar()
 
-    # Search input
     topic = st.text_input(
-        "研究课题 Research Topic",
+        "Research Topic / 研究课题",
         placeholder=(
             "e.g. Large Language Model, CRISPR gene editing, "
             "plant phenotyping deep learning, transformer attention mechanism..."
@@ -320,10 +323,10 @@ def main():
     col1, col2, _ = st.columns([2, 2, 4])
     with col1:
         search_btn = st.button(
-            "🔍 探索演化路径", type="primary", use_container_width=True
+            "🔍 Explore Evolution / 探索演化路径", type="primary", use_container_width=True
         )
     with col2:
-        clear_btn = st.button("🗑 清除结果", use_container_width=True)
+        clear_btn = st.button("🗑 Clear / 清除结果", use_container_width=True)
 
     if clear_btn:
         st.session_state.pop("evolution_path", None)
@@ -334,7 +337,6 @@ def main():
     if search_btn and topic.strip():
         run_search(topic.strip(), mode, years_back, max_papers)
 
-    # Show results
     if "evolution_path" in st.session_state:
         path = st.session_state["evolution_path"]
         explorer = st.session_state["explorer"]
@@ -345,22 +347,25 @@ def main():
         render_download_section(path, explorer)
 
     elif not topic.strip():
-        # Show placeholder examples
         st.divider()
-        st.markdown("### 💡 试试这些例子")
+        st.markdown("### 💡 Try these examples / 试试这些例子")
         examples = [
-            "`Large Language Model` — 从传统NLP到GPT的演进",
-            "`CRISPR gene editing` — 基因编辑技术的发展脉络",
-            "`plant phenotyping deep learning` — 植物表型深度学习的方法演化",
-            "`transformer attention mechanism` — 注意力机制的进化链",
-            "`single cell RNA sequencing` — 单细胞测序技术路线",
+            "`Large Language Model` — From traditional NLP to GPT / 从传统NLP到GPT的演进",
+            "`CRISPR gene editing` — Gene editing technology trajectory / 基因编辑技术发展脉络",
+            "`plant phenotyping deep learning` — Method evolution in plant DL / 植物表型深度学习方法演化",
+            "`transformer attention mechanism` — Attention mechanism lineage / 注意力机制进化链",
+            "`single cell RNA sequencing` — scRNA-seq technology roadmap / 单细胞测序技术路线",
         ]
         for ex in examples:
             st.markdown(f"- {ex}")
 
         st.info(
-            "**快速模式**: 输入课题 → 数秒内获得演化主线 + 每阶段关键论文 + PDF 下载\n\n"
-            "**全面模式**: 深度挖掘完整知识流变链路，适合写综述、开题报告"
+            "**Fast mode / 快速模式**: Enter a topic → get the evolution backbone "
+            "+ key papers per stage + PDF download in seconds.\n\n"
+            "**Comprehensive mode / 全面模式**: Deep mining of the full intellectual "
+            "lineage — ideal for literature reviews and proposal writing.\n\n"
+            "快速模式输入课题即得演化主线与每阶段关键论文；"
+            "全面模式深度挖掘完整知识流变链路，适合写综述、开题报告。"
         )
 
 
