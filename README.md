@@ -85,7 +85,7 @@ topic → multi-source search → time-window grouping → hub identification
 
 ## Author
 
-**Wise instone3** · [@Wise instone3](https://github.com/Wise instone3) · he/him
+**hchow26zijinport** · [@hchow26zijinport](https://github.com/hchow26zijinport) · he/him
 
 Bio: LLM development
 
