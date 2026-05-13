@@ -26,7 +26,7 @@ class BaseSource(ABC):
         self._cache = cache
         self._session = requests.Session()
         self._session.headers.update(
-            {"User-Agent": "LitSearch/0.1 (mailto:researcher@zju.edu.cn)"}
+            {"User-Agent": "LEExtractor/0.2"}
         )
 
     @abstractmethod
@@ -751,7 +751,7 @@ class ImpactFactorLookup:
         self._cache = cache or Cache()
         self._session = requests.Session()
         self._session.headers.update(
-            {"User-Agent": "LitSearch/0.1 (mailto:researcher@zju.edu.cn)"}
+            {"User-Agent": "LEExtractor/0.2"}
         )
         # In-memory cache for this session
         self._if_cache: dict[str, float | None] = {}
