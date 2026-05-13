@@ -1,8 +1,10 @@
-# 🧬 Literature Evolution Explorer
+# 🧬 LEExtractor — Literature Evolution Extractor
 
 **Research topic → knowledge evolution path → key paper PDFs**
 
-Input a research topic (e.g. "Large Language Model"), automatically discover how ideas evolved over time through citation flow analysis, identify hub papers at each evolutionary stage, and download PDFs.
+LEExtractor is a tool for **literature review writing** and **technology trajectory analysis**. Given a research topic, it automatically traces the intellectual lineage of ideas — from foundational work to state-of-the-art — by mining citation flow across time, identifying pivotal papers at each evolutionary stage, and providing one-click PDF downloads. Built for researchers who need to quickly map a field's conceptual genealogy before writing.
+
+> *"How did we get from backpropagation to GPT-4? What are the inflection points?"* — LEExtractor answers this in seconds.
 
 ## Features
 

@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import streamlit as st
 
 st.set_page_config(
-    page_title="Literature Evolution Explorer",
+    page_title="LEExtractor — Literature Evolution Extractor",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -23,8 +23,9 @@ st.set_page_config(
 
 
 def render_sidebar():
-    st.sidebar.title("🧬 Literature Evolution Explorer")
-    st.sidebar.caption("知识演化路径 · 文献发现 · PDF 下载")
+    st.sidebar.title("🧬 LEExtractor")
+    st.sidebar.caption("Literature Evolution Extractor")
+    st.sidebar.caption("文献综述写作 · 技术脉络梳理 · PDF 下载")
 
     mode = st.sidebar.radio(
         "搜索模式 Search Mode",
@@ -299,9 +300,10 @@ def render_download_section(path, explorer):
 
 
 def main():
-    st.title("🧬 Literature Evolution Explorer")
+    st.title("🧬 LEExtractor")
     st.caption(
-        "输入研究课题 → 自动发现知识演化路径 → 下载关键文献 PDF"
+        "Literature Evolution Extractor — "
+        "输入研究课题 → 自动梳理技术演化脉络 → 下载关键文献 PDF"
     )
 
     mode, years_back, max_papers = render_sidebar()
