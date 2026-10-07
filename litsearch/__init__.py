@@ -1,26 +1,26 @@
 """Systematic Literature Review Toolkit — LEExtractor."""
 
-__version__ = "0.3.0"
+__version__ = "0.6.0"
 
-from litsearch.models import Paper, Author, CitationNetwork, SearchResult
-from litsearch.search import (
-    LiteratureReviewWorkflow,
-    LiteratureExplorer,
-    ReviewState,
-    ReviewPhase,
-)
 from litsearch.cache import Cache
-from litsearch.sources import SourceManager, ImpactFactorLookup
-from litsearch.path_miner import EvolutionPathMiner, EvolutionPath, EraHub, EvolutionLink
-from litsearch.snowball import SnowballEngine, SnowballResult, SnowballRound
-from litsearch.similar import SimilarPaperFinder
+from litsearch.downloader import PaperDownloader
+from litsearch.models import Author, CitationNetwork, Paper, SearchResult
 from litsearch.prisma import (
-    PRISMATracker,
+    FULL_TEXT_EXCLUSION_REASONS,
     PRISMARecord,
     PRISMAReport,
+    PRISMATracker,
     ScreeningDecision,
+    ScreeningStage,
 )
-from litsearch.downloader import PaperDownloader
+from litsearch.search import (
+    LiteratureReviewWorkflow,
+    ReviewPhase,
+    ReviewState,
+)
+from litsearch.similar import SimilarPaperFinder
+from litsearch.snowball import SnowballEngine, SnowballResult, SnowballRound
+from litsearch.sources import ImpactFactorLookup, SourceManager
 
 __all__ = [
     # Models
@@ -30,18 +30,12 @@ __all__ = [
     "SearchResult",
     # Workflow
     "LiteratureReviewWorkflow",
-    "LiteratureExplorer",
     "ReviewState",
     "ReviewPhase",
     # Infrastructure
     "Cache",
     "SourceManager",
     "ImpactFactorLookup",
-    # Evolution (legacy)
-    "EvolutionPathMiner",
-    "EvolutionPath",
-    "EraHub",
-    "EvolutionLink",
     # Snowballing
     "SnowballEngine",
     "SnowballResult",
@@ -53,6 +47,8 @@ __all__ = [
     "PRISMARecord",
     "PRISMAReport",
     "ScreeningDecision",
+    "ScreeningStage",
+    "FULL_TEXT_EXCLUSION_REASONS",
     # Download
     "PaperDownloader",
 ]

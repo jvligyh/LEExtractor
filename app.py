@@ -1,634 +1,438 @@
-"""LEExtractor — Systematic Literature Review Toolkit (Streamlit GUI).
+"""LEExtractor: focused discovery workspace with optional PRISMA reporting."""
 
-4-Phase gold-standard workflow:
-1. Scoping — field landscape exploration
-2. Systematic Search — multi-database keyword search
-3. Snowballing — citation tracing + similar paper discovery
-4. PRISMA — screening + flow diagram + PDF download
-"""
-
+import json
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
-import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="LEExtractor — Literature Review Toolkit",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from litsearch import __version__
+from litsearch.bundle import build_evidence_pack
+from litsearch.config import openalex_api_key, s2_key_configured, set_env_value
+from litsearch.diagnostics import get_diagnostics, reset_diagnostics
+from litsearch.evidence import EvidenceGraph, corpus_papers
+from litsearch.export import to_bibtex, to_csv, to_ris
+from litsearch.filters import RelevanceFilter
+from litsearch.persistence import (
+    load_state,
+    save_state,
+    save_state_as,
+    state_from_dict,
+    state_to_dict,
 )
+from litsearch.prisma import FULL_TEXT_EXCLUSION_REASONS, ScreeningDecision, ScreeningStage
+from litsearch.search import LiteratureReviewWorkflow, ReviewState
 
-from litsearch.search import LiteratureReviewWorkflow, ReviewPhase
-from litsearch.prisma import ScreeningDecision
-from litsearch.sources import ImpactFactorLookup
-
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
+st.set_page_config(page_title="LEExtractor", page_icon="📚", layout="wide")
 
 
-def render_sidebar():
+def t(zh, en):
+    return en if st.session_state.get("language") == "English" else zh
+
+
+def persist(state):
+    try:
+        save_state(state)
+    except OSError as exc:
+        st.warning(t("保存失败：", "Save failed: ") + str(exc))
+
+
+def go(page):
+    st.session_state["page"] = page
+
+
+def load_demo():
+    from litsearch.demo import demo_state
+    state = demo_state()
+    st.session_state["review_state"] = state
+    st.session_state["topic_input"] = state.topic
+    st.session_state["direction_input"] = state.research_direction
+    persist(state)
+
+
+def diagnostics(state=None):
+    events = get_diagnostics().events
+    saved = (state.search_manifest.get("diagnostics", []) if state else [])
+    if events or saved:
+        st.warning(t("部分数据源请求未完成，结果可能不完整。", "Some provider requests failed; results may be incomplete."))
+        with st.expander(t("查看原因与建议", "Provider diagnostics")):
+            for event in events:
+                st.text(event.short(250))
+            if not events:
+                st.json(saved)
+            st.caption(t("限流时降低规模或配置数据源密钥；参数错误需要核对接口。", "For rate limits, reduce the search size or configure keys. Contract errors require checking the provider API."))
+
+
+def save_key(env_name, widget_key):
+    value = st.session_state.get(widget_key, "").strip()
+    if value:
+        set_env_value(env_name, value)
+        st.session_state[widget_key] = ""
+        st.session_state["key_saved"] = True
+
+
+def sidebar():
     st.sidebar.title("📚 LEExtractor")
-    st.sidebar.caption("Systematic Literature Review Toolkit")
-    st.sidebar.caption("系统文献综述工具 · PRISMA 2020 · TARCiS")
-
-    st.sidebar.divider()
-
-    # Global settings
-    st.sidebar.subheader("Global Settings / 全局设置")
-
-    years_back = st.sidebar.slider(
-        "Years Back / 回溯年数",
-        5, 50, 20,
-    )
-
-    st.sidebar.divider()
-
-    max_papers = st.sidebar.slider(
-        "Max Search Papers / 最大检索论文数",
-        50, 500, 200, 50,
-    )
-
-    st.sidebar.divider()
-    st.sidebar.caption(
-        "Sources / 数据源: Semantic Scholar · OpenAlex · arXiv · Crossref\n"
-        "Download / 下载: Sci-Hub · arXiv · OpenAccess"
-    )
-    st.sidebar.caption("v0.3.0 — PRISMA + TARCiS workflow")
-
-    return years_back, max_papers
-
-
-# ---------------------------------------------------------------------------
-# Phase indicator
-# ---------------------------------------------------------------------------
-
-
-PHASE_LABELS = {
-    ReviewPhase.SCOPING: "1. Scoping / 领域概览",
-    ReviewPhase.SYSTEMATIC_SEARCH: "2. Systematic Search / 系统检索",
-    ReviewPhase.SNOWBALLING: "3. Snowballing / 引文追溯",
-    ReviewPhase.SCREENING: "4. Screening & PRISMA / 筛选与报告",
-    ReviewPhase.COMPLETE: "✓ Complete / 完成",
-}
-
-
-def render_phase_indicator(phase):
-    """Show current phase with progress-style indicators."""
-    phase_order = {
-        ReviewPhase.SCOPING: 0,
-        ReviewPhase.SYSTEMATIC_SEARCH: 1,
-        ReviewPhase.SNOWBALLING: 2,
-        ReviewPhase.SCREENING: 3,
-        ReviewPhase.COMPLETE: 4,
-    }
-    cols = st.columns(4)
-    phases = [
-        (ReviewPhase.SCOPING, "1", "Scoping"),
-        (ReviewPhase.SYSTEMATIC_SEARCH, "2", "Search"),
-        (ReviewPhase.SNOWBALLING, "3", "Snowball"),
-        (ReviewPhase.SCREENING, "4", "PRISMA"),
-    ]
-    current_idx = phase_order.get(phase, 0)
-    for i, (ph, num, label) in enumerate(phases):
-        with cols[i]:
-            this_idx = phase_order.get(ph, 0)
-            if current_idx == this_idx:
-                st.markdown(f"**🔵 {num}. {label}**")
-            elif current_idx > this_idx:
-                st.markdown(f"✅ {num}. {label}")
-            else:
-                st.markdown(f"⚪ {num}. {label}")
-
-
-# ---------------------------------------------------------------------------
-# Phase 1: Scoping
-# ---------------------------------------------------------------------------
-
-
-def render_scoping(workflow, years_back):
-    st.subheader("Phase 1: Scoping / 领域概览")
-    st.caption("Explore the field landscape before committing to a full search.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        topic = st.text_input(
-            "Research Topic / 研究课题",
-            value=st.session_state.get("topic", ""),
-            placeholder="e.g. mint essential oil biosynthesis, plant phenotyping deep learning...",
-            key="scoping_topic",
-        )
-    with col2:
-        direction = st.text_input(
-            "Research Direction / 研究方向 (for relevance scoring)",
-            value=st.session_state.get("direction", ""),
-            placeholder="Describe your focus, e.g. terpenoid biosynthesis pathway...",
-            key="scoping_direction",
-        )
-
-    if st.button("🔍 Start Scoping / 开始概览", type="primary", use_container_width=True, disabled=not topic.strip()):
-        with st.spinner("Searching and analyzing field landscape..."):
-            state = workflow.scope_topic(
-                topic=topic.strip(),
-                research_direction=direction.strip(),
-                years_back=years_back,
-                initial_limit=50,
-            )
-            st.session_state["review_state"] = state
-            st.session_state["topic"] = topic.strip()
-            st.session_state["direction"] = direction.strip()
-            st.rerun()
-
-    state = st.session_state.get("review_state")
-    if state is None or state.phase != ReviewPhase.SCOPING:
-        return
-
-    st.divider()
-
-    # Show scoping results
-    if not state.scoping_papers:
-        st.info("No scoping results yet. Enter a topic and click 'Start Scoping'.")
-        return
-
-    # Stats bar
-    cols = st.columns(4)
-    cols[0].metric("Papers Found / 检索到文献", len(state.scoping_papers))
-    cols[1].metric("Key Journals / 主要期刊", len(state.key_journals))
-    cols[2].metric("Key Authors / 主要作者", len(state.key_authors))
-    cols[3].metric("Topic Clusters / 主题簇", len(state.topic_clusters))
-
-    st.divider()
-
-    # Topic clusters
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Topic Clusters / 主题簇")
-        for cluster_name, keywords in list(state.topic_clusters.items())[:6]:
-            st.markdown(f"**{cluster_name}**: {', '.join(keywords)}")
-
-    with col2:
-        # Year distribution chart
-        if state.year_distribution:
-            st.subheader("Publication Timeline / 发表时间分布")
-            fig, ax = plt.subplots(figsize=(5, 2.5))
-            years = list(state.year_distribution.keys())
-            counts = list(state.year_distribution.values())
-            ax.bar(years, counts, color="#3498db", alpha=0.8)
-            ax.set_xlabel("Year")
-            ax.set_ylabel("Count")
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            fig.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-
-    st.divider()
-
-    # Key journals and authors
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Key Journals / 主要期刊")
-        for journal, count in state.key_journals[:10]:
-            st.markdown(f"- {journal} ({count})")
-
-    with col2:
-        st.subheader("Key Authors / 主要作者")
-        for author, count in state.key_authors[:10]:
-            st.markdown(f"- {author} ({count})")
-
-    st.divider()
-    st.info("👉 Go to the **Systematic Search** tab (tab 2) to run the multi-database search.\n\n👉 转到 **系统检索** 标签页（第2个标签）执行多数据库检索。")
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: Systematic Search
-# ---------------------------------------------------------------------------
-
-
-def render_systematic_search(workflow, max_papers, years_back):
-    st.subheader("Phase 2: Systematic Search / 系统检索")
-    st.caption("Multi-database search: S2 + OpenAlex + arXiv + Crossref")
-
-    state = st.session_state.get("review_state")
-
-    if state is None:
-        st.warning("Complete scoping first (Tab 1).")
-        return
-
-    # Search config
-    col1, col2 = st.columns(2)
-    with col1:
-        min_cit = st.number_input("Min Citations / 最低引用数", 0, 1000, 0, 10, key="sys_min_cit")
-    with col2:
-        st.caption("")
-
-    # Show run button only if search hasn't been done yet
-    search_not_done = state.phase.value in {ReviewPhase.SCOPING.value}
-
-    if search_not_done:
-        if st.button("🔍 Run Systematic Search / 执行系统检索", type="primary", use_container_width=True):
-            with st.spinner(f"Searching across all databases for '{state.topic}'..."):
-                state = workflow.systematic_search(
-                    state,
-                    max_papers=max_papers,
-                    years_back=years_back,
-                    min_citations=min_cit,
-                )
-                st.session_state["review_state"] = state
-                st.rerun()
-        st.info("Configure search parameters above, then click the button.")
-        return
-
-    st.divider()
-
-    papers = state.search_papers
-    if not papers:
-        st.warning("Search returned no results. Try broader keywords or increase years back.")
-        # Let user re-run with the button even if phase has advanced
-        if st.button("🔄 Retry Search / 重新检索", use_container_width=True):
-            state = workflow.systematic_search(
-                state,
-                max_papers=max_papers,
-                years_back=years_back,
-                min_citations=min_cit,
-            )
-            st.session_state["review_state"] = state
-            st.rerun()
-        return
-
-    cols = st.columns(3)
-    cols[0].metric("Total Found / 检索结果", len(papers))
-    cols[1].metric(
-        "Avg Relevance / 平均相关度",
-        f"{sum(p.relevance_score for p in papers) / max(len(papers), 1):.3f}",
-    )
-    cols[2].metric(
-        "Avg Citations / 平均引用",
-        f"{sum(p.citation_count for p in papers) / max(len(papers), 1):.0f}",
-    )
-
-    st.divider()
-
-    # Top papers table
-    st.subheader(f"Top 20 Papers / 前20篇文献")
-    if_lookup = ImpactFactorLookup()
-
-    for idx, paper in enumerate(papers[:20]):
-        with st.container():
-            col1, col2 = st.columns([6, 1])
-            with col1:
-                venue_str = f" | {paper.venue}" if paper.venue else ""
-                if_val = if_lookup.get_if_display(paper.venue or "")
-                if "N/A" not in if_val:
-                    venue_str += f" | {if_val}"
-                preprint_tag = " [Preprint]" if paper.source == "arxiv" else ""
-
-                st.markdown(
-                    f"**{idx + 1}.** *{paper.title[:200]}*  "
-                    f"({paper.year or '?'}){preprint_tag}"
-                )
-                st.caption(
-                    f"👥 {', '.join(a.name for a in paper.authors[:3])}  |  "
-                    f"📖 {paper.citation_count} citations  |  "
-                    f"🎯 Relevance: {paper.relevance_score:.3f}"
-                    f"{venue_str}"
-                )
-            with col2:
-                if paper.url and paper.url.startswith("http"):
-                    st.link_button("📥 PDF", paper.url, use_container_width=True)
-                if paper.doi:
-                    st.link_button("🔗 DOI", f"https://doi.org/{paper.doi}", use_container_width=True)
-
-            if paper.abstract:
-                with st.expander("Abstract / 摘要"):
-                    st.write(paper.abstract[:500])
-
-            st.divider()
-
-    st.divider()
-    st.info("👉 Go to the **Snowballing** tab (tab 3) for citation tracing and similar paper discovery.\n\n👉 转到 **引文追溯** 标签页（第3个标签）执行引文追溯和相似文献发现。")
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Snowballing
-# ---------------------------------------------------------------------------
-
-
-def render_snowballing(workflow):
-    st.subheader("Phase 3: Snowballing + Similar Papers / 引文追溯与相似文献")
-    st.caption(
-        "TARCiS-aligned citation tracing: forward (cited-by) + backward (references). "
-        "Plus bibliographic coupling and co-citation analysis."
-    )
-
-    state = st.session_state.get("review_state")
-    if state is None or not state.search_papers:
-        st.warning("Complete systematic search first.")
-        return
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        num_seeds = st.number_input("Seed Papers / 种子论文数", 3, 30, 10)
-    with col2:
-        max_rounds = st.number_input("Snowball Rounds / 追溯轮次", 1, 5, 3)
-    with col3:
-        max_per_dir = st.number_input("Max per Direction / 每方向最多", 10, 100, 50)
-
-    btn_col1, btn_col2 = st.columns(2)
-
-    with btn_col1:
-        if st.button("🔄 Run Snowballing / 执行引文追溯", type="primary", use_container_width=True):
-            with st.spinner("Running iterative forward+backward snowballing..."):
-                state = workflow.run_snowballing(
-                    state,
-                    num_seeds=num_seeds,
-                    max_rounds=max_rounds,
-                    max_per_direction=max_per_dir,
-                )
-                st.session_state["review_state"] = state
-                st.rerun()
-
-    with btn_col2:
-        if st.button("🔗 Find Similar Papers / 查找相似文献", type="secondary", use_container_width=True):
-            with st.spinner("Finding similar papers via bibliographic coupling + co-citation..."):
-                state = workflow.find_similar(state, num_seeds=num_seeds)
-                st.session_state["review_state"] = state
-                st.rerun()
-
-    # Show snowball results
-    sn_result = state.snowball_result
-    if sn_result and sn_result.rounds:
-        st.divider()
-        st.subheader("Snowballing Results / 引文追溯结果")
-
-        cols = st.columns(3)
-        cols[0].metric("Total Rounds / 追溯轮次", len(sn_result.rounds))
-        cols[1].metric("Papers Discovered / 新发现文献", sn_result.total_discovered)
-        cols[2].metric("Saturated / 是否饱和", "Yes" if sn_result.saturated else "No")
-
-        for rnd in sn_result.rounds:
-            with st.expander(
-                f"Round {rnd.round_number}: {rnd.count} new papers / {rnd.count} 篇新文献"
-            ):
-                for p in rnd.new_papers[:10]:
-                    st.markdown(
-                        f"- **{p.title[:120]}** ({p.year or '?'}) — "
-                        f"Cited {p.citation_count}x | Rel: {p.relevance_score:.3f}"
-                    )
-
-    # Show similar papers
-    similar = state.similar_papers
-    if similar:
-        st.divider()
-        st.subheader(f"Similar Papers / 相似文献 ({len(similar)} found)")
-
-        for paper, score, method in similar[:15]:
-            method_label = "BC" if method == "bibliographic_coupling" else "CC"
-            st.markdown(
-                f"- **{paper.title[:120]}** ({paper.year or '?'}) — "
-                f"Score: {score:.2f} ({method_label})"
-            )
-
-    if state.phase in {ReviewPhase.SNOWBALLING, ReviewPhase.SCREENING, ReviewPhase.COMPLETE}:
-        st.divider()
-        st.info("👉 Go to the **PRISMA** tab (tab 4) to screen papers and generate the PRISMA flow diagram.\n\n👉 转到 **PRISMA** 标签页（第4个标签）筛选文献并生成PRISMA流程图。")
-
-
-# ---------------------------------------------------------------------------
-# Phase 4: PRISMA + Screening
-# ---------------------------------------------------------------------------
-
-
-def render_prisma(workflow):
-    st.subheader("Phase 4: Screening & PRISMA / 筛选与PRISMA报告")
-    st.caption("Screen papers by title/abstract and generate a PRISMA 2020 flow diagram.")
-
-    state = st.session_state.get("review_state")
-    if state is None:
-        st.warning("Complete earlier phases first.")
-        return
-
-    report = state.prisma.generate_report()
-
-    # Stats
-    cols = st.columns(4)
-    cols[0].metric("Total Tracked / 追踪文献", report.records_after_dedup)
-    cols[1].metric("Screened / 已筛选", report.records_screened)
-    cols[2].metric("Included / 已纳入", report.studies_included)
-    cols[3].metric("Pending / 待筛选", report.records_after_dedup - report.records_screened)
-
-    st.divider()
-
-    # Screening controls
-    col1, col2 = st.columns(2)
-    with col1:
-        threshold = st.slider(
-            "Auto-Screen Threshold / 自动筛选阈值",
-            0.0, 1.0, 0.15, 0.01,
-            help="Papers with relevance score >= threshold are auto-accepted, below are rejected.",
-        )
-    with col2:
-        st.caption("")
-        if st.button("⚡ Auto-Screen / 自动筛选", type="primary", use_container_width=True):
-            with st.spinner("Auto-screening papers by relevance..."):
-                state = workflow.auto_screen(state, relevance_threshold=threshold)
-                st.session_state["review_state"] = state
-                st.rerun()
-
-    st.divider()
-
-    # Manual screening queue
-    queue = workflow.get_screening_queue(state)
-    if queue:
-        st.subheader(f"Manual Screening Queue / 手动筛选队列 ({len(queue)} remaining)")
-
-        for record in queue[:20]:
-            paper = record.paper
-            with st.container():
-                col1, col2, col3, col4 = st.columns([5, 1, 1, 1])
-                with col1:
-                    st.markdown(
-                        f"**{paper.title[:150]}** ({paper.year or '?'})"
-                    )
-                    st.caption(
-                        f"Source: {record.source} | "
-                        f"Citations: {paper.citation_count} | "
-                        f"Relevance: {record.relevance_score:.3f}"
-                    )
-                with col2:
-                    if st.button("✅ Accept", key=f"acc_{paper.id[:30]}", use_container_width=True):
-                        workflow.screen_paper(state, paper.id, ScreeningDecision.ACCEPT)
-                        st.session_state["review_state"] = state
-                        st.rerun()
-                with col3:
-                    if st.button("❓ Maybe", key=f"may_{paper.id[:30]}", use_container_width=True):
-                        workflow.screen_paper(state, paper.id, ScreeningDecision.MAYBE)
-                        st.session_state["review_state"] = state
-                        st.rerun()
-                with col4:
-                    if st.button("❌ Reject", key=f"rej_{paper.id[:30]}", use_container_width=True):
-                        workflow.screen_paper(state, paper.id, ScreeningDecision.REJECT)
-                        st.session_state["review_state"] = state
-                        st.rerun()
-
-    # Accepted papers
-    included = workflow.get_included_papers(state)
-    if included:
-        st.divider()
-        st.subheader(f"Included Papers / 已纳入文献 ({len(included)})")
-
-        for paper in included[:15]:
-            with st.container():
-                col1, col2 = st.columns([6, 1])
-                with col1:
-                    st.markdown(
-                        f"- **{paper.title[:150]}** ({paper.year or '?'}) — "
-                        f"Cited {paper.citation_count}x"
-                    )
-                with col2:
-                    if paper.url and paper.url.startswith("http"):
-                        st.link_button("📥 PDF", paper.url, use_container_width=True)
-
-    st.divider()
-
-    # Generate PRISMA report
-    if st.button("📊 Generate PRISMA Report / 生成PRISMA流程图", type="primary", use_container_width=True):
-        report = workflow.generate_prisma_report(state)
+    st.sidebar.selectbox("语言 / Language", ["中文", "English"], key="language")
+    review = st.sidebar.checkbox(t("系统综述模式（PRISMA）", "Systematic review mode (PRISMA)"), key="review_mode")
+    pages = ["explore", "papers", "expand", "landscape", "export"]
+    if review:
+        pages.insert(4, "review")
+    labels = {"explore": t("研究探索", "Explore"), "papers": t("文献结果", "Papers"),
+              "expand": t("引文扩展", "Expand citations"), "landscape": t("证据版图", "Evidence landscape"),
+              "review": t("筛选与 PRISMA", "Screening & PRISMA"), "export": t("保存与导出", "Save & export")}
+    if st.session_state.get("page") not in pages:
+        st.session_state["page"] = "explore"
+    page = st.sidebar.radio(t("工作区", "Workspace"), pages, format_func=labels.get, key="page")
+    with st.sidebar.expander(t("检索范围", "Search scope")):
+        years_back = st.slider(t("回溯年数", "Years back"), 5, 50, 20, key="years_back",
+                               help=t("年份条件用于数据库检索；引文扩展默认允许更早的基础文献。", "Applies to database search. Citation expansion can include older foundational papers."))
+        max_papers = st.slider(t("最多保留文献", "Maximum retained papers"), 50, 500, 200, 50, key="max_papers",
+                               help=t("多源结果合并、排序后保留前 N 篇；值越大，后续阅读和 API 请求越多。", "Keep the top N papers after merging and ranking. Larger searches require more reading and API calls."))
+    with st.sidebar.expander(t("数据源设置", "Provider settings")):
+        st.caption("Semantic Scholar: " + t("已配置", "configured") if s2_key_configured() else "Semantic Scholar: " + t("未配置", "not configured"))
+        st.text_input("S2_API_KEY", type="password", key="s2_key")
+        st.button(t("保存 S2 密钥", "Save S2 key"), on_click=save_key, args=("S2_API_KEY", "s2_key"))
+        st.link_button(t("申请 S2 密钥", "Get an S2 key"), "https://www.semanticscholar.org/product/api#api-key-form")
+        st.caption("OpenAlex: " + t("已配置", "configured") if openalex_api_key() else "OpenAlex: " + t("未配置", "not configured"))
+        st.text_input("OPENALEX_API_KEY", type="password", key="oa_key")
+        st.button(t("保存 OpenAlex 密钥", "Save OpenAlex key"), on_click=save_key, args=("OPENALEX_API_KEY", "oa_key"))
+        st.link_button(t("申请 OpenAlex 密钥", "Get an OpenAlex key"), "https://openalex.org/settings/api")
+        st.caption(t("保存后立即生效；密钥只写入本机 .env。", "Saved keys apply immediately and stay in the local .env file."))
+    if st.session_state.pop("key_saved", False):
+        st.sidebar.success(t("密钥已保存", "Key saved"))
+    st.sidebar.caption(f"v{__version__}")
+    return page, years_back, max_papers
+
+
+def run_action(action):
+    reset_diagnostics()
+    try:
+        state = action()
         st.session_state["review_state"] = state
+        persist(state)
         st.rerun()
+    except (ValueError, OSError) as exc:
+        st.error(str(exc))
 
-    # Show PRISMA diagram
-    if state.phase == ReviewPhase.COMPLETE or report.studies_included > 0:
+
+def explore(workflow, years_back, max_papers):
+    st.header(t("从研究问题开始", "Start with a research question"))
+    st.caption(t("先找到相关文献，再决定是否扩展引文或开展系统综述。", "Find relevant papers, then decide whether to expand citations or run a systematic review."))
+    state = st.session_state.get("review_state")
+    topic = st.text_input(t("检索关键词", "Search keywords"), value=state.topic if state else "",
+                          placeholder="deep learning plant phenotyping", key="topic_input")
+    direction = st.text_area(t("你关注的具体问题", "Your research focus"), value=state.research_direction if state else "",
+                             placeholder=t("研究对象、方法、任务和场景，例如：使用图像预测小麦表型", "Object, method, task and context, e.g. predicting wheat traits from images"), key="direction_input")
+    st.caption(t("当前默认采用词法排序，不自动翻译中文。检索国际数据库时建议填写英文关键词；中文研究问题可保留作记录。", "Default ranking is lexical and does not translate queries. English keywords work best with international databases; retain your original research question for context."))
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(t("检索文献", "Search papers"), type="primary", disabled=not topic.strip(), width="stretch"):
+            fresh = ReviewState(topic=topic.strip(), research_direction=direction.strip() or topic.strip(), start_time=time.time())
+            with st.spinner(t("合并多源检索结果…", "Searching and merging provider results…")):
+                run_action(lambda: workflow.systematic_search(fresh, years_back=years_back, max_papers=max_papers))
+    with col2:
+        if st.button(t("先看领域概览", "Scope the field first"), disabled=not topic.strip(), width="stretch"):
+            with st.spinner(t("正在分析检索样本…", "Analyzing a scoping sample…")):
+                run_action(lambda: workflow.scope_topic(topic.strip(), direction.strip(), years_back=years_back))
+    if state:
         st.divider()
-        st.subheader("PRISMA 2020 Flow Diagram / PRISMA流程图")
-
-        report = state.prisma.generate_report()
-        mermaid = report.to_mermaid()
-        st.markdown(mermaid)
-
-        # Flow data as expandable JSON
-        with st.expander("Flow Data / 流程数据"):
-            st.json(report.to_flow_dict())
-
-    # Download section
-    if included:
-        st.divider()
-        st.subheader("📦 Batch Download / 批量下载")
-
-        st.info(
-            f"{len(included)} papers ready for download. "
-            f"PDFs saved to: `{workflow.downloader.get_download_dir()}`"
-        )
-
-        if st.button("📥 Download All Included PDFs / 下载全部纳入文献", type="primary", use_container_width=True):
-            progress = st.progress(0)
-            status_text = st.empty()
-
-            results = []
-            for i, paper in enumerate(included):
-                status_text.text(f"Downloading ({i + 1}/{len(included)}): {paper.title[:80]}...")
-                path = workflow.downloader.download_pdf(paper)
-                results.append((paper, path))
-                progress.progress((i + 1) / len(included))
-
-            success = [r for r in results if r[1] is not None]
-            status_text.text(f"Done: {len(success)}/{len(included)} succeeded")
-            st.success(
-                f"Download complete! {len(success)} PDFs saved to "
-                f"`{workflow.downloader.get_download_dir()}`"
-            )
-
-            failures = [r for r in results if r[1] is None]
-            if failures:
-                with st.expander(f"⚠️ {len(failures)} failed / 下载失败"):
-                    for p, _ in failures:
-                        st.write(f"- {p.title[:100]}")
-
-    # Export buttons
-    if included:
-        st.divider()
-        st.subheader("Export / 导出")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            csv_data = workflow.export_included_csv(state)
-            st.download_button(
-                "📄 Download CSV",
-                csv_data,
-                file_name=f"literature_review_{state.topic[:30]}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with col2:
-            ris_data = workflow.export_included_ris(state)
-            st.download_button(
-                "📚 Download RIS (EndNote/Zotero)",
-                ris_data,
-                file_name=f"literature_review_{state.topic[:30]}.ris",
-                mime="application/x-research-info-systems",
-                use_container_width=True,
-            )
+        st.success(t(f"当前项目：{state.topic}", f"Current project: {state.topic}"))
+        if state.scoping_papers:
+            cols = st.columns(3)
+            cols[0].metric(t("样本文献", "Scoping papers"), len(state.scoping_papers))
+            cols[1].metric(t("主要期刊", "Journals"), len(state.key_journals))
+            cols[2].metric(t("关键词簇", "Keyword clusters"), len(state.topic_clusters))
+            for name, terms in list(state.topic_clusters.items())[:6]:
+                st.write(f"**{name}** · {', '.join(terms)}")
+            st.caption(t("关键词共现仅反映检索样本，不等同于全领域语义主题。", "Keyword co-occurrence describes this sample, not the entire field or semantic topics."))
+        if not state.search_papers:
+            if st.button(t("在当前项目执行完整检索", "Run a full search for this project"), type="primary"):
+                with st.spinner(t("检索中…", "Searching…")):
+                    run_action(lambda: workflow.systematic_search(state, years_back=years_back, max_papers=max_papers))
+        else:
+            st.button(t("查看文献结果 →", "View papers →"), on_click=go, args=("papers",))
+        diagnostics(state)
+    with st.expander(t("离线演示", "Offline demo")):
+        st.caption(t("使用明确标注的模拟文献验证交互，不调用外部 API。", "Use explicitly synthetic papers to exercise the workflow without external APIs."))
+        st.button(t("加载模拟演示", "Load synthetic demo"), on_click=load_demo)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def paper_card(paper, index=0):
+    with st.container(border=True):
+        st.markdown(f"**{index + 1}. {paper.title}**")
+        st.caption(f"{paper.year or '?'} · {paper.venue or paper.source} · " + t(f"引用 {paper.citation_count} · 相关度 {paper.relevance_score:.3f}", f"Citations {paper.citation_count} · Relevance {paper.relevance_score:.3f}"))
+        if paper.url and paper.url.startswith(("https://", "http://")):
+            st.link_button(t("论文页面", "Paper page"), paper.url)
+        with st.expander(t("摘要与发现依据", "Abstract & discovery evidence")):
+            st.write(paper.abstract or t("数据源未提供摘要", "No abstract supplied by the provider"))
+            st.caption(t("为什么找到这篇论文", "Why this paper appeared"))
+            for trace in paper.discovery_traces:
+                st.write({"method": trace.method, "provider": trace.provider, "query": trace.query,
+                          "seed": trace.seed_id, "round": trace.round_no, "score": trace.score,
+                          "evidence": trace.evidence_ids})
+            if paper.score_breakdown:
+                st.json(paper.score_breakdown)
+            st.caption(t("这些信号解释发现过程，不代表论文质量，也不替代阅读。", "These signals explain discovery, not research quality or full-text assessment."))
+
+
+def papers_page(state):
+    st.header(t("文献结果", "Paper results"))
+    papers = corpus_papers(state)
+    def providers(paper):
+        return {paper.source} | {trace.provider for trace in paper.discovery_traces if trace.provider and trace.method != "demo_fixture"}
+    st.caption(t(f"合并后共 {len(papers)} 篇。先缩小列表，再挑选种子论文。", f"{len(papers)} merged papers. Narrow the list before choosing seeds."))
+    a, b, c = st.columns(3)
+    threshold = a.slider(t("最低相关度", "Minimum relevance"), 0.0, 1.0, 0.0, 0.05, key="result_threshold")
+    sources = b.multiselect(t("数据源", "Providers"), sorted({source for p in papers for source in providers(p)}), key="result_sources")
+    sort = c.selectbox(t("排序", "Sort by"), ["relevance", "citations", "year"], format_func=lambda k: {"relevance": t("相关度", "Relevance"), "citations": t("引用数", "Citations"), "year": t("最新发表", "Newest")}[k])
+    text = st.text_input(t("标题或摘要包含", "Title or abstract contains"), key="result_text")
+    years = [p.year for p in papers if p.year]
+    year_range = None
+    if years and min(years) < max(years):
+        year_range = st.slider(t("发表年份", "Publication years"), min(years), max(years), (min(years), max(years)))
+    filtered = [p for p in papers if p.relevance_score >= threshold and (not sources or set(sources) & providers(p))
+                and (not text or text.casefold() in f"{p.title} {p.abstract or ''}".casefold())
+                and (not year_range or (p.year and year_range[0] <= p.year <= year_range[1]))]
+    filtered.sort(key=lambda p: {"relevance": p.relevance_score, "citations": p.citation_count, "year": p.year or 0}[sort], reverse=True)
+    page_count = max(1, (len(filtered) + 9) // 10)
+    page = st.number_input(t("页码", "Page"), 1, page_count, 1)
+    st.caption(t(f"符合条件 {len(filtered)} 篇，每页显示 10 篇。", f"{len(filtered)} matches, 10 papers per page."))
+    for index, paper in enumerate(filtered[(page - 1) * 10:page * 10], start=(page - 1) * 10):
+        paper_card(paper, index)
+    if not filtered:
+        st.info(t("没有符合条件的文献，请放宽筛选条件。", "No matches. Relax the filters."))
+    st.button(t("扩展引文 →", "Expand citations →"), on_click=go, args=("expand",))
+    diagnostics(state)
+
+
+def expand_page(workflow, state):
+    st.header(t("从已有文献继续扩展", "Expand from your existing papers"))
+    st.caption(t("引文追溯找基础与后续工作；文献耦合找共享参考文献的论文，共被引找被共同引用的论文。", "Citation tracing finds foundations and later work. Coupling uses shared references; co-citation uses common citing papers."))
+    if not state.search_papers:
+        st.info(t("请先执行文献检索。", "Run a paper search first."))
+        return
+    if state.search_manifest.get("mode") == "synthetic_demo":
+        from litsearch.demo import DemoSource
+        workflow = LiteratureReviewWorkflow(DemoSource())
+        st.info(t("演示模式使用模拟引文，所有扩展均在本机完成。", "Demo expansion uses synthetic citations entirely on this machine."))
+    a, b, c = st.columns(3)
+    seeds = a.number_input(t("种子论文数", "Seed papers"), 1, min(30, len(state.search_papers)), min(5, len(state.search_papers)),
+                           help=t("从检索结果中取相关度最高的 N 篇作为起点。", "Start from the N highest-ranked search results."))
+    rounds = b.number_input(t("最多追溯轮次", "Maximum rounds"), 1, 5, 2, help=t("每轮最多选择 20 篇新文献继续扩展；新增少于 5 篇时提前结束。", "Up to 20 new papers seed the next round. Stop early when fewer than 5 papers are added."))
+    size = c.number_input(t("每篇每方向上限", "Papers per seed per direction"), 10, 100, 20, 10)
+    st.caption(t("增大范围会增加 API 请求和阅读工作量。每轮保存可恢复的检查点。", "Larger ranges increase API calls and reading workload. Each completed round saves a recoverable checkpoint."))
+    resume = bool(state.snowball_result and not state.snowball_result.completed and state.snowball_result.parameters)
+    def run_snowball():
+        progress = st.progress(0.0)
+        status = st.empty()
+        def on_round(number, total, found):
+            progress.progress(min(1.0, number / total))
+            status.write(t(f"第 {number} 轮新增 {found} 篇", f"Round {number}: {found} new papers"))
+            persist(state)
+        params = state.snowball_result.parameters if resume else {}
+        return workflow.run_snowballing(state, num_seeds=len(params.get("seed_ids", [])) or seeds,
+                                       max_rounds=rounds, max_per_direction=params.get("max_per_direction", size),
+                                       min_citations=params.get("min_citations", 0), year_from=params.get("year_from", 1900),
+                                       year_to=params.get("year_to"), on_round=on_round, resume=resume)
+    a, b = st.columns(2)
+    if a.button(t("继续上次追溯" if resume else "追溯引文", "Resume citation tracing" if resume else "Trace citations"), type="primary", width="stretch"):
+        with st.spinner(t("正在追溯并保存…", "Tracing and saving checkpoints…")):
+            run_action(run_snowball)
+    if b.button(t("查找关联文献（BC / CC）", "Find related papers (BC / CC)"), width="stretch"):
+        with st.spinner(t("分析共享参考文献与共被引关系…", "Analyzing coupling and co-citation…")):
+            run_action(lambda: workflow.find_similar(state, num_seeds=seeds))
+    sn = state.snowball_result
+    if sn:
+        st.metric(t("新增文献（不含原有文献）", "New papers (excluding the original corpus)"), sn.total_discovered)
+        st.dataframe([{t("轮次", "Round"): r.round_number, t("返回记录", "Fetched"): r.raw_count, t("去重新增", "New unique"): r.unique_count,
+                       t("保留文献", "Retained"): r.count, t("相关度 ≥ 0.15", "Relevance ≥ 0.15"): r.relevant_count,
+                       t("重复率", "Duplicate rate"): round(1 - r.unique_count / r.raw_count, 3) if r.raw_count else 0,
+                       t("累计新增", "Cumulative new"): r.cumulative_unique} for r in sn.rounds], hide_index=True, width="stretch")
+        if sn.saturated:
+            st.info(t("本轮新增少于 5 篇，已按当前规则停止。可检查种子和关键词后决定是否扩大范围；这不代表找齐了全部文献。", "Fewer than 5 papers were added, so the current rule stopped expansion. Revisit seeds or keywords if needed; this does not establish complete coverage."))
+    if state.similar_papers:
+        st.success(t(f"找到 {len(state.similar_papers)} 篇关联文献，已加入文献结果。", f"{len(state.similar_papers)} related papers added to your results."))
+    diagnostics(state)
+    st.button(t("查看证据版图 →", "View evidence landscape →"), on_click=go, args=("landscape",))
+
+
+def landscape_page(state):
+    st.header(t("证据版图", "Evidence landscape"))
+    graph = EvidenceGraph(corpus_papers(state))
+    summary = graph.summary()
+    a, b, c = st.columns(3)
+    a.metric(t("文献节点", "Paper nodes"), summary["nodes"])
+    b.metric(t("已观察引文边", "Observed citation edges"), summary["edges"])
+    c.metric(t("引文社群", "Citation communities"), len(summary["communities"]))
+    st.caption(t("箭头从引用者指向被引用者。PageRank 与社群仅描述当前证据集，不评价质量、不推断创新性。", "Arrows point from citing to cited papers. PageRank and communities describe this corpus, not quality or novelty."))
+    if summary["timeline"]:
+        st.bar_chart({"year": list(summary["timeline"]), "papers": list(summary["timeline"].values())}, x="year", y="papers")
+    names = {p.canonical_id: p.title for p in graph.papers}
+    if summary["central_papers"]:
+        st.dataframe([{t("论文", "Paper"): names[row["paper_id"]], "PageRank": row["score"]} for row in summary["central_papers"]], hide_index=True, width="stretch")
+        edges = list(graph.graph.edges)[:100]
+        nodes = sorted({node for edge in edges for node in edge})
+        labels = {key: f"n{i}" for i, key in enumerate(nodes)}
+        dot = ['digraph evidence { rankdir=TB; node [shape=box, style=rounded, fontsize=12];']
+        for key in nodes:
+            title = "\n".join(textwrap.wrap(names[key][:100], width=32))
+            dot.append(f'{labels[key]} [label={json.dumps(title)}];')
+        dot += [f"{labels[u]} -> {labels[v]};" for u, v in edges]
+        st.graphviz_chart("\n".join([*dot, "}"]))
+        if len(graph.graph.edges) > 100:
+            st.caption(t("预览仅显示前 100 条边；导出包含完整图。", "Preview shows the first 100 edges; exports contain the full graph."))
+        with st.expander(t("查询证据路径", "Find an evidence path")):
+            source = st.selectbox(t("起点", "From"), list(names), format_func=names.get, key="path_source")
+            target = st.selectbox(t("终点", "To"), list(names), format_func=names.get, key="path_target")
+            path = graph.path(source, target)
+            st.write(" → ".join(names[k] for k in path) if path else t("当前证据中没有有向引文路径。", "No directed citation path exists in the observed evidence."))
+    else:
+        st.info(t("目前没有能在证据集内对齐的引文边。可先扩展引文，系统不会补造关系。", "No in-corpus citation edges can currently be resolved. Expand citations to collect evidence."))
+
+
+def apply_threshold(relevant, irrelevant):
+    value, note = RelevanceFilter.calibrate_threshold(relevant, irrelevant)
+    st.session_state["screen_threshold"] = value
+    st.session_state["calibration_note"] = note
+
+
+def review_page(workflow, state):
+    st.header(t("筛选与 PRISMA", "Screening & PRISMA"))
+    stage_name = st.radio(t("评估阶段", "Assessment stage"), ["title", "full"], horizontal=True,
+                          format_func=lambda k: t("标题与摘要", "Title & abstract") if k == "title" else t("全文评估", "Full text"))
+    stage = ScreeningStage.TITLE_ABSTRACT if stage_name == "title" else ScreeningStage.FULL_TEXT
+    if stage_name == "title":
+        threshold = st.slider(t("自动初筛阈值", "Automatic screening threshold"), 0.0, 1.0, 0.15, 0.01, key="screen_threshold")
+        st.caption(t("分数随候选集变化，只用于初筛；全文纳入需人工评估。", "Scores depend on the candidate set and support preliminary screening; full-text inclusion requires manual assessment."))
+        if st.button(t("按阈值处理待筛文献", "Screen pending papers by threshold")):
+            workflow.auto_screen(state, relevance_threshold=threshold)
+            persist(state)
+            st.rerun()
+        with st.expander(t("用已知文献标定阈值", "Calibrate using known papers")):
+            rel, irr = [], []
+            for p in corpus_papers(state)[:12]:
+                label = st.selectbox(p.title, ["unlabelled", "relevant", "irrelevant"], key=f"cal_{p.canonical_id}",
+                                     format_func=lambda k: {"unlabelled": t("未标注", "Unlabelled"), "relevant": t("相关", "Relevant"), "irrelevant": t("不相关", "Irrelevant")}[k])
+                if label == "relevant":
+                    rel.append(p)
+                elif label == "irrelevant":
+                    irr.append(p)
+            st.button(t("计算并应用阈值", "Compute & apply threshold"), disabled=len(rel) + len(irr) < 2,
+                      on_click=apply_threshold, args=(rel, irr))
+            if st.session_state.get("calibration_note"):
+                st.info(st.session_state["calibration_note"])
+    queue = workflow.get_screening_queue(state, stage)
+    # MAYBE remains actionable instead of disappearing from the queue.
+    if stage_name == "title":
+        queue += [r for r in state.prisma.records.values() if r.screening_decision == ScreeningDecision.MAYBE]
+    else:
+        queue += [r for r in state.prisma.records.values() if r.passed_screening and r.full_text_decision == ScreeningDecision.MAYBE]
+    st.subheader(t(f"待处理 {len(queue)} 篇", f"{len(queue)} papers to assess"))
+    for record in queue[:10]:
+        paper = record.paper
+        key = f"{stage.value}_{paper.canonical_id}"
+        with st.container(border=True):
+            st.write(f"**{paper.title}** ({paper.year or '?'})")
+            if paper.abstract:
+                with st.expander(t("摘要", "Abstract")):
+                    st.write(paper.abstract)
+            reason = st.text_input(t("决定理由", "Decision reason"), key=f"reason_{key}")
+            if stage_name == "full":
+                retrieved = st.checkbox(t("已获取并阅读全文", "Full text retrieved and assessed"), value=record.full_text_retrieved, key=f"read_{key}")
+                if st.button(t("尝试下载开放获取全文", "Try downloading open-access full text"), key=f"pdf_{key}"):
+                    with st.spinner(t("查找开放获取版本…", "Looking for open-access copies…")):
+                        path = workflow.downloader.download_pdf(paper)
+                    if path:
+                        workflow.mark_full_text_retrieved(state, paper.id, True)
+                        persist(state)
+                        st.success(str(path))
+                    else:
+                        st.info(t("未获取到 OA 版本。可通过机构访问或手动获取；下载失败不会自动排除文献。", "No OA copy retrieved. Try institutional or manual access. A failed download does not automatically exclude the paper."))
+                reason_labels = [value.rsplit("/", 1)[0 if st.session_state["language"] == "中文" else -1].strip() for value in FULL_TEXT_EXCLUSION_REASONS]
+                reason_choice = st.selectbox(t("全文排除原因", "Full-text exclusion reason"), reason_labels, key=f"exclude_{key}")
+                exclusion = FULL_TEXT_EXCLUSION_REASONS[reason_labels.index(reason_choice)]
+            else:
+                retrieved, exclusion = True, ""
+            a, b, c = st.columns(3)
+            decisions = [(a, ScreeningDecision.ACCEPT, t("纳入", "Accept")), (b, ScreeningDecision.MAYBE, t("待复核", "Maybe")), (c, ScreeningDecision.REJECT, t("排除", "Reject"))]
+            for column, decision, label in decisions:
+                if column.button(label, key=f"{decision.value}_{key}", disabled=decision == ScreeningDecision.ACCEPT and not retrieved, width="stretch"):
+                    if stage_name == "full" and decision == ScreeningDecision.REJECT and exclusion == FULL_TEXT_EXCLUSION_REASONS[0]:
+                        workflow.mark_full_text_retrieved(state, paper.id, False)
+                    else:
+                        workflow.screen_paper(state, paper.id, decision, reason or (exclusion if decision == ScreeningDecision.REJECT else ""), stage=stage)
+                    persist(state)
+                    st.rerun()
+    report = state.prisma.generate_report()
+    st.divider()
+    st.caption(t("报告仅映射已记录的筛选状态。未完成全文评估时属于初筛结果。", "The report reflects recorded screening decisions. Without full-text assessment, inclusion is preliminary."))
+    st.json(report.to_flow_dict(), expanded=False)
+    st.download_button(t("下载 PRISMA 流程图 Markdown", "Download PRISMA flow Markdown"), report.to_mermaid(), "prisma_flow.md", mime="text/markdown")
+
+
+def export_page(state):
+    st.header(t("保存与导出", "Save & export"))
+    papers = corpus_papers(state)
+    selection = st.radio(t("导出范围", "Export selection"), ["all", "included"], horizontal=True,
+                         format_func=lambda value: t("全部发现文献", "All discovered papers") if value == "all" else t("筛选纳入文献", "Included papers"))
+    selected = papers if selection == "all" else state.prisma.get_included_papers()
+    st.caption(t(f"当前选择 {len(selected)} 篇。RIS / BibTeX 可导入 Zotero；证据包用于复现与 AI 交接。", f"{len(selected)} selected papers. Import RIS / BibTeX into Zotero; use the evidence pack for reproducibility and AI handoff."))
+    a, b, c = st.columns(3)
+    a.download_button("CSV", "\ufeff" + to_csv(selected, include_abstract=True), "papers.csv", mime="text/csv")
+    b.download_button("RIS", to_ris(selected), "references.ris", mime="application/x-research-info-systems")
+    c.download_button("BibTeX", to_bibtex(selected), "references.bib", mime="text/plain")
+    st.download_button(t("下载完整证据包 ZIP", "Download complete evidence pack ZIP"), build_evidence_pack(state), "evidence_pack.zip", mime="application/zip")
+    st.caption(t("完整证据包始终包含整个项目，以及检索配置、发现路径、引文图和可恢复会话。", "The complete pack always contains the whole project, search configuration, discovery traces, citation graph and restorable session."))
+    st.download_button(t("备份当前会话 JSON", "Backup session JSON"), json.dumps(state_to_dict(state), ensure_ascii=False), "session.json", mime="application/json")
+    if st.button(t("保留项目快照到本机", "Save a named local snapshot")):
+        st.success(save_state_as(state))
+    upload = st.file_uploader(t("恢复会话 JSON", "Restore session JSON"), type=["json"])
+    if upload and st.button(t("恢复该会话", "Restore this session")):
+        try:
+            restored = state_from_dict(json.load(upload))
+            st.session_state["review_state"] = restored
+            persist(restored)
+            st.rerun()
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            st.error(t("会话格式无法读取：", "Invalid session format: ") + str(exc))
 
 
 def main():
-    st.title("📚 LEExtractor")
-    st.caption(
-        "Systematic Literature Review Toolkit — "
-        "Scoping → Systematic Search → Snowballing → PRISMA → PDF Download\n"
-        "系统文献综述工具 — 领域概览→系统检索→引文追溯→PRISMA筛选→PDF下载"
-    )
-
-    years_back, max_papers = render_sidebar()
-
-    # Initialize workflow
+    st.markdown("<style>.block-container{max-width:1120px;padding-top:2rem}div[data-testid='stCaptionContainer']{font-size:0.95rem}</style>", unsafe_allow_html=True)
+    if "review_state" not in st.session_state and not st.session_state.get("restored_once"):
+        st.session_state["restored_once"] = True
+        restored = load_state()
+        if restored:
+            st.session_state["review_state"] = restored
+            st.session_state["restore_note"] = True
     if "workflow" not in st.session_state:
         st.session_state["workflow"] = LiteratureReviewWorkflow()
-
-    workflow = st.session_state["workflow"]
+    page, years_back, max_papers = sidebar()
     state = st.session_state.get("review_state")
-
-    # Phase indicator
-    if state is not None:
-        render_phase_indicator(state.phase)
-        st.divider()
-
-    # Tabs for the 4 phases
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "1. Scoping / 领域概览",
-        "2. Systematic Search / 系统检索",
-        "3. Snowballing / 引文追溯",
-        "4. PRISMA & Export / 筛选与导出",
-    ])
-
-    with tab1:
-        render_scoping(workflow, years_back)
-
-    with tab2:
-        render_systematic_search(workflow, max_papers, years_back)
-
-    with tab3:
-        render_snowballing(workflow)
-
-    with tab4:
-        render_prisma(workflow)
-
-    # Footer
-    st.divider()
-    st.caption(
-        "Methodology: Gusenbauer (2024) + TARCiS statement + PRISMA 2020 | "
-        "Sources: Semantic Scholar · OpenAlex · arXiv · Crossref | "
-        "PDF: Sci-Hub · arXiv · OpenAccess"
-    )
+    if st.session_state.pop("restore_note", False):
+        st.info(t("已恢复上次保存的项目。", "Restored your last saved project."))
+    if state and state.search_manifest.get("mode") == "synthetic_demo":
+        st.warning(t("当前为模拟演示文献，不可作为真实科研证据。", "Synthetic demo papers: do not use as real research evidence."))
+    workflow = st.session_state["workflow"]
+    if page == "explore":
+        explore(workflow, years_back, max_papers)
+    elif state is None:
+        st.info(t("请先在研究探索中输入课题，或加载离线演示。", "Start a project in Explore or load the offline demo."))
+    elif page == "papers":
+        papers_page(state)
+    elif page == "expand":
+        expand_page(workflow, state)
+    elif page == "landscape":
+        landscape_page(state)
+    elif page == "review":
+        review_page(workflow, state)
+    elif page == "export":
+        export_page(state)
 
 
 if __name__ == "__main__":

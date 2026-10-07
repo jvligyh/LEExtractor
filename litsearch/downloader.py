@@ -1,35 +1,34 @@
-"""PDF downloader with multi-source fallback: Sci-Hub → OA → arXiv."""
+"""PDF downloader with open-access fallback: arXiv → Unpaywall → OpenAlex OA.
 
-import os
+Only legitimate, publisher-sanctioned sources are used.  The previous
+implementation fell back to scraping Sci-Hub for paywalled articles; that
+tier has been removed (it is copyright infringement in most jurisdictions,
+and the mirrors are unreliable).  Everything below resolves to an
+author/publisher-provided open-access copy, or reports "not available".
+"""
+
+import hashlib
+import logging
 import re
 import time
-import logging
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 
+from litsearch.config import default_download_dir, openalex_api_key, unpaywall_email
+from litsearch.identifiers import normalize_arxiv, normalize_doi
 from litsearch.models import Paper
 
 logger = logging.getLogger(__name__)
 
-# Sci-Hub domains to try (ordered by reliability)
-SCI_HUB_DOMAINS = [
-    "https://sci-hub.se",
-    "https://sci-hub.st",
-    "https://sci-hub.ru",
-]
+UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
 
 
 class PaperDownloader:
     """Download PDFs from multiple sources with automatic fallback."""
 
     def __init__(self, download_dir: str = ""):
-        self._download_dir = (
-            Path(download_dir) if download_dir
-            else Path.home() / "Downloads" / "litsearch_pdfs"
-        )
+        self._download_dir = Path(download_dir or default_download_dir())
         self._download_dir.mkdir(parents=True, exist_ok=True)
         self._session = requests.Session()
         self._session.headers.update({
@@ -45,28 +44,29 @@ class PaperDownloader:
     def get_download_url(self, paper: Paper) -> str | None:
         """Find a downloadable PDF URL for a paper.
 
-        Priority: Open Access → arXiv → Sci-Hub.
-        Returns None if no source found.
+        Priority: arXiv preprint → OpenAlex/Unpaywall open-access copy.
+        Returns None if no legitimate open-access source is available.
         """
-        # 1. Direct OA URL from paper metadata
+        return next(self._candidate_urls(paper), None)
+
+    def _candidate_urls(self, paper: Paper):
+        """Resolve lazily so a working direct PDF does not need extra APIs."""
         if paper.url and self._is_pdf_url(paper.url):
-            return paper.url
+            yield paper.url
 
         # 2. arXiv preprint
         arxiv_id = self._extract_arxiv_id(paper)
         if arxiv_id:
-            return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            yield f"https://arxiv.org/pdf/{arxiv_id}.pdf"
 
-        # 3. Check OpenAlex for OA link
+        # 3. OpenAlex: best open-access location
         oa_url = self._check_openalex_oa(paper)
         if oa_url:
-            return oa_url
+            yield oa_url
 
-        # 4. Sci-Hub (last resort)
-        if paper.doi:
-            return self._scihub_url(paper.doi)
-
-        return None
+        # 4. Unpaywall (aggregates publisher-hosted OA copies)
+        if paper.doi and (url := self._unpaywall_url(paper.doi)):
+            yield url
 
     def download_pdf(
         self, paper: Paper, filename: str | None = None, skip_existing: bool = True
@@ -79,44 +79,63 @@ class PaperDownloader:
             skip_existing: Skip if file already exists.
         """
         if filename is None:
-            filename = self._sanitize_filename(paper)
+            filename = self._sanitize_filename(paper) + "_" + hashlib.sha256(paper.canonical_id.encode()).hexdigest()[:10]
+        if Path(filename).name != filename or any(c in filename for c in ('/', '\\', ':')):
+            raise ValueError("Filename must be a file name, without a directory")
 
         filepath = self._download_dir / f"{filename}.pdf"
-        if skip_existing and filepath.exists():
+        if skip_existing and filepath.exists() and self._valid_pdf(filepath.read_bytes()):
             logger.info("Already downloaded: %s", filepath)
             return str(filepath)
+        attempted = set()
+        for url in self._candidate_urls(paper):
+            if url in attempted:
+                continue
+            attempted.add(url)
+            if self._download_url(url, filepath, paper):
+                return str(filepath)
+        logger.warning("No working PDF URL for: %s", paper.title[:60])
+        return None
 
-        url = self.get_download_url(paper)
-        if url is None:
-            logger.warning("No download URL for: %s", paper.title[:60])
-            return None
+    @staticmethod
+    def _valid_pdf(body: bytes) -> bool:
+        return body[:1024].lstrip().startswith(b"%PDF-") and b"%%EOF" in body[-2048:]
 
+    def _download_url(self, url, filepath, paper) -> bool:
         try:
             resp = self._session.get(url, timeout=60, stream=True)
-            if resp.status_code == 200 and len(resp.content) > 10000:
-                with open(filepath, "wb") as f:
-                    f.write(resp.content)
-                logger.info("Downloaded: %s (%d KB)", filename, len(resp.content) // 1024)
-                return str(filepath)
-            else:
+            content_type = resp.headers.get("content-type", "").lower()
+            body = resp.content
+            if resp.status_code != 200:
                 logger.warning(
-                    "Download failed for %s: HTTP %d, size=%d",
-                    paper.doi, resp.status_code, len(resp.content)
+                    "Download failed for %s: HTTP %d", paper.doi, resp.status_code
                 )
-                return None
+                return False
+            # Guard against HTML "not found"/captcha pages being saved as PDFs.
+            if not self._valid_pdf(body):
+                logger.warning(
+                    "Not a PDF for %s (content-type=%s, %d bytes)",
+                    paper.doi, content_type, len(body),
+                )
+                return False
+            with open(filepath, "wb") as f:
+                f.write(body)
+            logger.info("Downloaded: %s (%d KB)", filepath.name, len(body) // 1024)
+            return True
         except Exception as e:
             logger.warning("Download error for %s: %s", paper.doi or paper.title[:40], e)
-            return None
+            return False
 
     def batch_download(
-        self, papers: list[Paper], max_workers: int = 3
+        self, papers: list[Paper], delay_seconds: float = 1.0
     ) -> list[tuple[Paper, str | None]]:
         """Download multiple papers sequentially. Returns (paper, path_or_None)."""
         results = []
         for paper in papers:
-            path = self.download_paper(paper)
+            path = self.download_pdf(paper)
             results.append((paper, path))
-            time.sleep(1.0)  # Be polite
+            if delay_seconds:
+                time.sleep(delay_seconds)  # Be polite to OA hosts
         return results
 
     def get_download_dir(self) -> str:
@@ -126,73 +145,75 @@ class PaperDownloader:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _scihub_url(self, doi: str) -> str | None:
-        """Try to get a Sci-Hub direct PDF link for a DOI."""
-        for base in SCI_HUB_DOMAINS:
-            try:
-                # Fetch the Sci-Hub page for this DOI
-                resp = self._session.get(
-                    f"{base}/{doi}", timeout=20, allow_redirects=True
-                )
-                if resp.status_code != 200:
-                    continue
+    def _unpaywall_url(self, doi: str) -> str | None:
+        """Ask Unpaywall for a publisher-hosted open-access PDF.
 
-                soup = BeautifulSoup(resp.text, "lxml")
-                # Sci-Hub embeds the PDF in an <iframe> or <embed>
-                for tag in soup.find_all(["iframe", "embed"]):
-                    src = tag.get("src", "")
-                    if src and ("pdf" in src.lower() or "download" in src.lower()):
-                        if src.startswith("//"):
-                            src = "https:" + src
-                        elif src.startswith("/"):
-                            src = urljoin(base, src)
-                        return src
-
-                # Alternate: look for direct PDF link
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if ".pdf" in href.lower():
-                        if href.startswith("//"):
-                            href = "https:" + href
-                        return href
-
-                # If the response itself is PDF
-                if "application/pdf" in resp.headers.get("content-type", ""):
-                    return resp.url
-
-            except Exception:
-                continue
-
-        return None
-
-    def _check_openalex_oa(self, paper: Paper) -> str | None:
-        """Check OpenAlex for an open-access PDF URL."""
-        if not paper.doi:
+        Requires an e-mail (Unpaywall ToS): set LEEXTRACTOR_UNPAYWALL_EMAIL.
+        """
+        email = unpaywall_email()
+        if not email:
             return None
         try:
             resp = self._session.get(
-                f"https://api.openalex.org/works/https://doi.org/{paper.doi}",
-                params={"select": "open_access,primary_location"},
+                f"{UNPAYWALL_BASE}/{doi}", params={"email": email}, timeout=15
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data.get("is_oa"):
+                return None
+            for loc in [data.get("best_oa_location")] + (data.get("oa_locations") or []):
+                if not loc:
+                    continue
+                for key in ("url_for_pdf", "url"):
+                    url = loc.get(key)
+                    if url and self._looks_like_pdf(url):
+                        return url
+        except Exception as e:
+            logger.warning("Unpaywall lookup failed for %s: %s", doi, e)
+        return None
+
+    @staticmethod
+    def _looks_like_pdf(url: str) -> bool:
+        lowered = url.lower()
+        return lowered.endswith(".pdf") or "/pdf" in lowered or "pdf" in lowered
+
+    def _check_openalex_oa(self, paper: Paper) -> str | None:
+        """Check OpenAlex for an open-access PDF URL."""
+        identifier = normalize_doi(paper.doi) or paper.identifiers.openalex_id
+        if not identifier:
+            return None
+        try:
+            resp = self._session.get(
+                "https://api.openalex.org/works/" + (f"https://doi.org/{identifier}" if normalize_doi(identifier) else identifier),
+                params={"select": "open_access,primary_location,best_oa_location"},
+                headers={"Authorization": f"Bearer {openalex_api_key()}"} if openalex_api_key() else {},
                 timeout=10,
             )
             if resp.status_code == 200:
                 data = resp.json()
                 oa = data.get("open_access", {})
-                if oa.get("is_oa") and oa.get("oa_url"):
+                if oa.get("is_oa") and oa.get("oa_url") and self._looks_like_pdf(oa["oa_url"]):
                     return oa["oa_url"]
-                loc = data.get("primary_location", {})
-                if loc.get("pdf_url"):
-                    return loc["pdf_url"]
-        except Exception:
-            pass
+                for loc_key in ("best_oa_location", "primary_location"):
+                    loc = data.get(loc_key) or {}
+                    for url_key in ("pdf_url", "landing_page_url"):
+                        url = loc.get(url_key)
+                        if url and self._looks_like_pdf(url):
+                            return url
+        except Exception as exc:
+            logger.debug("OpenAlex OA lookup failed for %s: %s", identifier, exc)
         return None
 
     @staticmethod
     def _extract_arxiv_id(paper: Paper) -> str | None:
         """Extract arXiv ID from paper metadata."""
-        # Check abstract and URL for arXiv IDs
-        text_sources = [paper.abstract or "", paper.url or "", paper.id]
+        if value := normalize_arxiv(paper.identifiers.arxiv_id):
+            return value
+        text_sources = [paper.url or "", paper.id]
         for text in text_sources:
+            if value := normalize_arxiv(text):
+                return value
             m = re.search(r"arxiv[:\s]*(\d{4}\.\d{4,5})", text, re.IGNORECASE)
             if m:
                 return m.group(1)

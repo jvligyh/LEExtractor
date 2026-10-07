@@ -6,21 +6,35 @@ Gold-standard review methodology:
 - PRISMA 2020: standard flow diagram for reporting
 """
 
-import time
 import logging
+import re
+import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from collections import Counter, defaultdict
 
-from litsearch.models import Paper, SearchResult
-from litsearch.sources import SourceManager
-from litsearch.filters import RelevanceFilter
-from litsearch.snowball import SnowballEngine, SnowballResult
-from litsearch.similar import SimilarPaperFinder
-from litsearch.prisma import PRISMATracker, PRISMAReport, ScreeningDecision
+from litsearch.config import current_year, year_from_years_back
 from litsearch.downloader import PaperDownloader
+from litsearch.filters import RelevanceFilter
+from litsearch.models import DiscoveryTrace, Paper
+from litsearch.prisma import (
+    PRISMAReport,
+    PRISMATracker,
+    ScreeningDecision,
+    ScreeningStage,
+)
+from litsearch.similar import SimilarPaperFinder
+from litsearch.snowball import SnowballEngine, SnowballResult, paper_key
+from litsearch.sources import SourceManager
 
 logger = logging.getLogger(__name__)
+
+
+def ranking_query(state: "ReviewState") -> str:
+    """Keep the research goal verbatim; use English keywords if a Chinese-only
+    goal is paired with an English database query. This is not translation."""
+    direction = state.research_direction
+    return direction if re.search(r"[a-zA-Z]{3,}", direction) else state.topic
 
 
 class ReviewPhase(Enum):
@@ -58,6 +72,7 @@ class ReviewState:
 
     # Stats
     start_time: float = 0.0
+    search_manifest: dict = field(default_factory=dict)
 
     @property
     def elapsed(self) -> float:
@@ -114,15 +129,15 @@ class LiteratureReviewWorkflow:
             start_time=time.time(),
         )
 
-        year_from = max(1990, 2026 - years_back)
+        year_from = year_from_years_back(years_back, floor=1990)
 
         papers = self.sources.search_all_sources(
-            topic, limit=initial_limit, year_from=year_from, year_to=2026,
+            topic, limit=initial_limit, year_from=year_from, year_to=current_year(),
         )
         papers = self.filters.deduplicate_by_doi(papers)
 
-        if research_direction:
-            self.filters.compute_relevance(papers, research_direction)
+        self.filters.compute_relevance(papers, ranking_query(state))
+        papers = papers[:initial_limit]
 
         # Topic clusters from keyword co-occurrence
         state.topic_clusters = self._cluster_topics(papers)
@@ -149,6 +164,7 @@ class LiteratureReviewWorkflow:
         state.year_distribution = dict(sorted(year_dist.items()))
 
         state.scoping_papers = papers
+        state.search_manifest = dict(getattr(self.sources, "last_search_manifest", {}))
         logger.info(
             "Scoping complete: topic='%s', papers=%d, journals=%d, authors=%d",
             topic, len(papers), len(state.key_journals), len(state.key_authors),
@@ -198,19 +214,37 @@ class LiteratureReviewWorkflow:
         Searches S2 + OpenAlex + arXiv + Crossref, deduplicates,
         scores relevance, and registers results in the PRISMA tracker.
         """
-        year_from = max(1990, 2026 - years_back)
+        year_from = year_from_years_back(years_back, floor=1990)
 
         papers = self.sources.search_all_sources(
-            state.topic, limit=max_papers, year_from=year_from, year_to=2026,
+            state.topic, limit=max_papers, year_from=year_from, year_to=current_year(),
         )
         papers = self.filters.deduplicate_by_doi(papers)
-        self.filters.compute_relevance(papers, state.research_direction)
+        unique_count = len(papers)
+        self.filters.compute_relevance(papers, ranking_query(state))
 
         if min_citations > 0:
             papers = [p for p in papers if p.citation_count >= min_citations]
 
         papers.sort(key=lambda p: p.relevance_score, reverse=True)
+        papers = papers[:max_papers]
+        # A new search is a new corpus; old screening and expansion decisions
+        # must never silently carry over to a different candidate set.
+        state.prisma = PRISMATracker()
+        state.snowball_result = None
+        state.similar_papers = []
         state.search_papers = papers
+        state.search_manifest = dict(getattr(self.sources, "last_search_manifest", {}))
+        state.search_manifest.update({"unique_before_filters": unique_count, "returned_count": len(papers),
+                                      "min_citations": min_citations, "research_direction": state.research_direction,
+                                      "ranking_query": ranking_query(state),
+                                      "ranking": "hybrid_lexical_v1"})
+        for p in papers:
+            if not p.discovery_traces:
+                p.discovery_traces.append(DiscoveryTrace(method="keyword", provider=p.source, query=state.topic))
+            for trace in p.discovery_traces:
+                if trace.method == "keyword" and trace.score is None:
+                    trace.score = p.relevance_score
         state.phase = ReviewPhase.SYSTEMATIC_SEARCH
 
         state.prisma.add_papers(papers, source="database_search")
@@ -233,13 +267,18 @@ class LiteratureReviewWorkflow:
         max_per_direction: int = 50,
         min_citations: int = 0,
         year_from: int = 1900,
-        year_to: int = 2026,
+        year_to: int | None = None,
+        on_round=None,
+        resume: bool = False,
     ) -> ReviewState:
         """Phase 3a: Iterative forward+backward citation tracing (TARCiS-aligned).
 
         Uses the top-N most relevant papers from systematic search as seeds,
         then iteratively fetches references (backward) and citations (forward),
         stopping at saturation.
+
+        `on_round(round_number, max_rounds, discovered)` fires after each
+        round so callers can show progress and checkpoint the session.
         """
         if not state.search_papers:
             # Auto-run phase 2 if needed
@@ -247,31 +286,45 @@ class LiteratureReviewWorkflow:
 
         seeds = state.search_papers[:num_seeds]
 
+        year_to = year_to or current_year()
+
         engine = SnowballEngine(
             sources=self.sources,
             filters=self.filters,
         )
 
+        def checkpoint(partial):
+            state.snowball_result = partial
+            state.phase = ReviewPhase.SNOWBALLING
+            for paper in partial.all_papers.values():
+                if state.prisma._find_key(paper.id) is None:
+                    state.prisma.add_papers([paper], source="snowballing")
+
         result = engine.run(
             seed_papers=seeds,
-            research_direction=state.research_direction,
+            research_direction=ranking_query(state),
             max_rounds=max_rounds,
             max_per_direction=max_per_direction,
             min_citations=min_citations,
             year_from=year_from,
             year_to=year_to,
+            on_round=on_round,
+            on_checkpoint=checkpoint,
+            resume=state.snowball_result if resume else None,
+            known_papers=state.search_papers,
         )
 
         state.snowball_result = result
 
         # Add newly discovered papers to PRISMA (skip those already in search results)
         existing_ids = {
-            (p.doi or p.id).lower() for p in state.search_papers
+            paper_key(p) for p in state.search_papers
         }
         for paper in result.all_papers.values():
-            key = (paper.doi or paper.id).lower()
-            if key not in existing_ids:
+            key = paper_key(paper)
+            if key not in existing_ids and state.prisma._find_key(paper.id) is None:
                 state.prisma.add_papers([paper], source="snowballing")
+        state.phase = ReviewPhase.SNOWBALLING
 
         logger.info(
             "Snowballing: rounds=%d, discovered=%d, saturated=%s",
@@ -293,10 +346,11 @@ class LiteratureReviewWorkflow:
 
         finder = SimilarPaperFinder(sources=self.sources)
         similar = finder.find_similar(seeds, top_k=top_k)
+        self.filters.compute_relevance([p for p, _, _ in similar], ranking_query(state))
 
         state.similar_papers = similar
 
-        for paper, score, method in similar:
+        for paper, _score, _method in similar:
             state.prisma.add_papers([paper], source="similar")
 
         state.phase = ReviewPhase.SNOWBALLING
@@ -313,9 +367,11 @@ class LiteratureReviewWorkflow:
     # Phase 4: Screening + PRISMA
     # ------------------------------------------------------------------
 
-    def get_screening_queue(self, state: ReviewState) -> list:
-        """Get papers pending screening, sorted by relevance."""
-        return state.prisma.get_screening_queue()
+    def get_screening_queue(
+        self, state: ReviewState, stage: ScreeningStage = ScreeningStage.TITLE_ABSTRACT
+    ) -> list:
+        """Get papers pending at a given PRISMA stage, sorted by relevance."""
+        return state.prisma.get_screening_queue(stage)
 
     def screen_paper(
         self,
@@ -323,35 +379,55 @@ class LiteratureReviewWorkflow:
         paper_id: str,
         decision: ScreeningDecision,
         reason: str = "",
+        stage: ScreeningStage = ScreeningStage.TITLE_ABSTRACT,
     ) -> None:
-        """Record a single screening decision."""
-        state.prisma.screen_paper(paper_id, decision, reason)
+        """Record a single screening decision at one stage."""
+        state.prisma.screen_paper(paper_id, decision, reason, stage=stage)
+
+    def mark_full_text_retrieved(
+        self, state: ReviewState, paper_id: str, retrieved: bool = True
+    ) -> None:
+        """Record whether a full text could be obtained (eligibility stage)."""
+        state.prisma.mark_full_text_retrieved(paper_id, retrieved)
 
     def auto_screen(
         self,
         state: ReviewState,
         relevance_threshold: float = 0.15,
+        stage: ScreeningStage = ScreeningStage.TITLE_ABSTRACT,
     ) -> ReviewState:
         """Auto-screen by relevance: >= threshold → accept, < threshold → reject."""
-        for record in state.prisma.get_screening_queue():
+        for record in state.prisma.get_screening_queue(stage):
             if record.relevance_score >= relevance_threshold:
-                state.prisma.screen_paper(record.paper.id, ScreeningDecision.ACCEPT)
+                state.prisma.screen_paper(
+                    record.paper.id, ScreeningDecision.ACCEPT, stage=stage
+                )
             else:
                 state.prisma.screen_paper(
                     record.paper.id,
                     ScreeningDecision.REJECT,
-                    reason=f"Below relevance threshold ({record.relevance_score:.2f} < {relevance_threshold})",
+                    reason=(
+                        f"Below relevance threshold "
+                        f"({record.relevance_score:.2f} < {relevance_threshold})"
+                    ),
+                    stage=stage,
                 )
         state.phase = ReviewPhase.SCREENING
 
         accepted = len(state.prisma.get_accepted_ids())
-        logger.info("Auto-screen: accepted=%d by threshold=%.2f", accepted, relevance_threshold)
+        logger.info(
+            "Auto-screen(%s): accepted=%d by threshold=%.2f", stage.value, accepted, relevance_threshold
+        )
         return state
 
     def generate_prisma_report(self, state: ReviewState) -> PRISMAReport:
         """Generate PRISMA 2020 flow diagram report."""
         report = state.prisma.generate_report()
-        state.phase = ReviewPhase.COMPLETE
+        unresolved = any(r.screening_decision in (ScreeningDecision.PENDING, ScreeningDecision.MAYBE)
+                         or (r.passed_screening and r.full_text_decision in (ScreeningDecision.PENDING, ScreeningDecision.MAYBE))
+                         for r in state.prisma.records.values())
+        if report.full_text_stage_enabled and not unresolved:
+            state.phase = ReviewPhase.COMPLETE
         return report
 
     def get_included_papers(self, state: ReviewState) -> list[Paper]:
@@ -412,77 +488,3 @@ class LiteratureReviewWorkflow:
     def export_included_ris(self, state: ReviewState) -> str:
         from litsearch.export import to_ris
         return to_ris(self.get_included_papers(state))
-
-
-# ------------------------------------------------------------------
-# Backward-compatible alias
-# ------------------------------------------------------------------
-
-
-class LiteratureExplorer:
-    """Legacy wrapper: maps old fast_search/comprehensive_search to new workflow.
-
-    Prefer LiteratureReviewWorkflow for new code.
-    """
-
-    def __init__(self):
-        self.workflow = LiteratureReviewWorkflow()
-        self.downloader = self.workflow.downloader
-
-    def fast_search(self, topic, years_back=20, max_papers=100):
-        """Quick search via the new 4-phase workflow (auto-screened)."""
-        state = self.workflow.run_full_workflow(
-            topic=topic,
-            years_back=years_back,
-            max_search_papers=max_papers,
-            snowball_rounds=1,
-            auto_screen_threshold=0.12,
-        )
-        return self._state_to_path(state)
-
-    def comprehensive_search(self, topic, years_back=30, max_papers=500):
-        """Deep search via the new 4-phase workflow."""
-        state = self.workflow.run_full_workflow(
-            topic=topic,
-            years_back=years_back,
-            max_search_papers=max_papers,
-            snowball_rounds=3,
-            auto_screen_threshold=0.10,
-        )
-        return self._state_to_path(state)
-
-    def _state_to_path(self, state: ReviewState):
-        """Convert ReviewState to a legacy EvolutionPath-compatible object."""
-        from litsearch.path_miner import EvolutionPath, EraHub
-
-        path = EvolutionPath()
-        path.topic = state.topic
-        path.coverage = "fast" if state.snowball_result and len(state.snowball_result.rounds) <= 1 else "comprehensive"
-        path.total_papers_analyzed = state.total_papers_tracked
-
-        # Group papers by year into era-like buckets
-        included = self.workflow.get_included_papers(state)
-        if not included:
-            included = state.search_papers[:30]
-
-        year_groups: dict[str, list[Paper]] = defaultdict(list)
-        for p in included:
-            decade = f"{(p.year or 2020) // 5 * 5}s"
-            year_groups[decade].append(p)
-
-        for era_label in sorted(year_groups.keys()):
-            papers = year_groups[era_label]
-            keywords = self.workflow.filters.extract_keywords(
-                " ".join(p.title for p in papers), top_n=4
-            )
-            era = EraHub(
-                era_label=era_label,
-                start_year=int(era_label.replace("s", "")),
-                end_year=int(era_label.replace("s", "")) + 4,
-                key_papers=papers[:5],
-                total_papers=len(papers),
-                keywords=keywords,
-            )
-            path.eras.append(era)
-
-        return path

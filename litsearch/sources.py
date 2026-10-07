@@ -1,15 +1,119 @@
-"""API clients for Semantic Scholar, OpenAlex, and Crossref."""
+"""API clients for Semantic Scholar, OpenAlex, Crossref and arXiv."""
 
-import time
 import logging
+import re
+import time
 from abc import ABC, abstractmethod
 
 import requests
 
-from litsearch.models import Paper, Author
 from litsearch.cache import Cache
+from litsearch.config import current_year, openalex_api_key, semantic_scholar_api_key
+from litsearch.diagnostics import (
+    ParseError,
+    SourceError,
+    SourceErrorKind,
+    classify_http_error,
+    get_diagnostics,
+)
+from litsearch.identifiers import (
+    PaperIdentifiers,
+    normalize_arxiv,
+    normalize_doi,
+    normalize_openalex,
+)
+from litsearch.models import Author, DiscoveryTrace, Paper
 
 logger = logging.getLogger(__name__)
+
+
+def raise_for_data(resp, source: str, context: str = "") -> None:
+    """`raise_for_status()` that classifies the failure first.
+
+    Call this instead of `resp.raise_for_status()` so a malformed query (400)
+    and a dropped connection never look the same downstream: both become a
+    :class:`SourceError` of the right kind, recorded in the diagnostics log.
+    """
+    if resp.status_code < 400:
+        return
+    try:
+        body = resp.text[:200]
+    except Exception:  # pragma: no cover - body already unreadable
+        body = ""
+    exc = classify_http_error(source, resp.status_code, body, url=resp.url or "")
+    exc.detail = f"{exc.detail} [{context}]" if context else exc.detail
+    get_diagnostics().record(
+        source, exc.kind, exc.detail, exc.status, context
+    )
+    raise exc
+
+
+def as_source_error(exc: BaseException, source: str, context: str = ""):
+    """Classify any exception escaping a request call, and record it.
+
+    Call sites become:
+
+        except Exception as e:
+            log_source_failure(e, "semantic_scholar", "search")
+    """
+    diag = get_diagnostics()
+    if isinstance(exc, SourceError):  # already classified by raise_for_data
+        return exc
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        err = classify_http_error(
+            source, exc.response.status_code, "", url=exc.response.url or ""
+        )
+        err.detail = f"{err.detail} [{context}]" if context else err.detail
+        diag.record(source, err.kind, err.detail, err.status, context)
+        return err
+    if isinstance(
+        exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+    ):
+        diag.record(source, SourceErrorKind.TRANSIENT, str(exc)[:200], None, context)
+        return exc
+    if isinstance(exc, (ValueError, KeyError, TypeError, AttributeError)):
+        diag.record(source, SourceErrorKind.PARSE, str(exc)[:200], None, context)
+        return ParseError(source, str(exc)[:200])
+    diag.record(source, SourceErrorKind.UNKNOWN, str(exc)[:200], None, context)
+    return exc
+
+
+def log_source_failure(exc: BaseException, source: str, context: str = "") -> None:
+    """Record and log a classified failure at the right severity."""
+    err = as_source_error(exc, source, context)
+    if isinstance(err, SourceError) and err.kind in (
+        SourceErrorKind.CONTRACT,
+        SourceErrorKind.PARSE,
+    ):
+        # These never fix themselves: our request or our parser is wrong.
+        logger.error("%s: %s", context or source, err)
+    elif isinstance(err, SourceError) and err.kind == SourceErrorKind.NOT_FOUND:
+        logger.info("%s: %s", context or source, err)
+    else:
+        logger.warning("%s: %s", context or source, err)
+
+
+def resolve_year_to(year_to: int | None) -> int:
+    """Default the end of a publication window to the current year."""
+    return int(year_to) if year_to else current_year()
+
+
+def s2_paper_id(paper_id: str) -> str:
+    """Normalise an identifier for Semantic Scholar path segments.
+
+    S2 accepts `DOI:10.xxxx/yyy` but NOT a bare DOI: `/paper/10.1038/nature1`
+    returns 404.  Papers built by this package use the DOI as `Paper.id`
+    whenever one exists, so without this helper every citation/reference
+    lookup silently returned nothing.
+    """
+    pid = (paper_id or "").strip()
+    if doi := normalize_doi(pid):
+        return f"DOI:{doi}"
+    if pid.lower().startswith("s2:"):
+        return pid[3:]
+    if ax := normalize_arxiv(pid):
+        return f"ARXIV:{ax}"
+    return pid
 
 
 # ---------------------------------------------------------------------------
@@ -25,13 +129,11 @@ class BaseSource(ABC):
     def __init__(self, cache: Cache | None = None):
         self._cache = cache
         self._session = requests.Session()
-        self._session.headers.update(
-            {"User-Agent": "LEExtractor/0.2"}
-        )
+        self._session.headers.update({"User-Agent": "LEExtractor/0.3"})
 
     @abstractmethod
     def search_papers(
-        self, query: str, limit: int = 50, year_from: int = 2000, year_to: int = 2026
+        self, query: str, limit: int = 50, year_from: int = 1900, year_to: int | None = None
     ) -> list[Paper]:
         """Search papers by keyword query."""
 
@@ -54,11 +156,11 @@ class BaseSource(ABC):
     def _cached(self, func_name: str, *args) -> dict | list | None:
         if self._cache is None:
             return None
-        return self._cache.get(func_name, *[str(a) for a in args])
+        return self._cache.get(self.name, "parser_v3", func_name, *[str(a) for a in args])
 
     def _cache_set(self, value, func_name: str, *args):
         if self._cache is not None:
-            self._cache.set(value, func_name, *[str(a) for a in args])
+            self._cache.set(value, self.name, "parser_v3", func_name, *[str(a) for a in args])
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +178,109 @@ S2_SEARCH_FIELDS = (
 )
 S2_CITATION_FIELDS = "paperId,title,abstract,authors,year,citationCount,externalIds,journal,url"
 
+# OpenAlex removed the plain `abstract` field from /works; only the inverted
+# index can be selected.  Abstracts are reconstructed in _paper_from_oa().
+OA_SELECT = (
+    "id,doi,title,abstract_inverted_index,authorships,publication_year,"
+    "cited_by_count,referenced_works_count,referenced_works,"
+    "primary_location,topics,publication_date"
+)
+OA_SELECT_MIN = (
+    "id,doi,title,authorships,publication_year,cited_by_count,"
+    "primary_location,topics"
+)
+
+
+_S2_STATS: dict[str, int] = {"requests": 0, "rate_limited": 0, "retries": 0}
+
+
+def s2_stats() -> dict[str, int]:
+    """Request counters for the current process (used by the GUI warnings)."""
+    return dict(_S2_STATS)
+
+
+def reset_s2_stats() -> None:
+    _S2_STATS.update({"requests": 0, "rate_limited": 0, "retries": 0})
+
+
+def _reconstruct_abstract(data: dict) -> str:
+    """Rebuild an abstract string from OpenAlex' abstract_inverted_index."""
+    inv = data.get("abstract_inverted_index")
+    if not inv:
+        return ""
+    positions: list[tuple[int, str]] = []
+    for word, idxs in inv.items():
+        for i in idxs:
+            positions.append((i, word))
+    positions.sort(key=lambda x: x[0])
+    return " ".join(w for _, w in positions)
+
 
 class SemanticScholarSource(BaseSource):
-    """Semantic Scholar Academic Graph API client."""
+    """Semantic Scholar Academic Graph API client.
+
+    Without an API key S2 hands out a very small shared quota, so every
+    request is paced and 429s are retried with exponential backoff instead of
+    silently degrading the search.
+    """
 
     name = "semantic_scholar"
+
+    # How long to wait between requests, by quota tier.
+    PACE_WITH_KEY = 0.2
+    PACE_WITHOUT_KEY = 1.2
+    MAX_RETRIES = 3
+
+    def __init__(self, cache: Cache | None = None):
+        super().__init__(cache)
+        self._last_request_at = 0.0
+
+    # -- transport ------------------------------------------------------
+
+    def _pace(self) -> None:
+        interval = (
+            self.PACE_WITH_KEY if semantic_scholar_api_key() else self.PACE_WITHOUT_KEY
+        )
+        elapsed = time.time() - self._last_request_at
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+        self._last_request_at = time.time()
+
+    def _request(self, method: str, url: str, **kwargs):
+        """Send a request with pacing and 429 backoff.
+
+        Honours `Retry-After` when present, otherwise backs off
+        exponentially (3s → 6s → 12s).  After MAX_RETRIES the last response is
+        returned as-is so callers can degrade gracefully.
+        """
+        api_key = semantic_scholar_api_key()
+        if api_key:
+            self._session.headers["x-api-key"] = api_key
+        else:
+            self._session.headers.pop("x-api-key", None)
+        kwargs.setdefault("timeout", 30)
+        last = None
+        for attempt in range(self.MAX_RETRIES + 1):
+            self._pace()
+            _S2_STATS["requests"] += 1
+            resp = self._session.request(method, url, **kwargs)
+            if resp.status_code != 429:
+                return resp
+            last = resp
+            _S2_STATS["rate_limited"] += 1
+            if attempt == self.MAX_RETRIES:
+                break
+            retry_after = (resp.headers.get("Retry-After") or "").strip()
+            delay = float(retry_after) if retry_after.isdigit() else 3.0 * (2 ** attempt)
+            delay = min(delay, 60.0)
+            logger.warning(
+                "S2 rate limited (429) on %s — retrying in %.1fs (attempt %d/%d). "
+                "Set S2_API_KEY for a much larger quota.",
+                url, delay, attempt + 1, self.MAX_RETRIES,
+            )
+            time.sleep(delay)
+            _S2_STATS["retries"] += 1
+        return last
 
     def _paper_from_s2(self, data: dict) -> Paper:
         ext = data.get("externalIds") or {}
@@ -106,8 +306,9 @@ class SemanticScholarSource(BaseSource):
             doi=doi,
             citation_count=data.get("citationCount") or 0,
             reference_count=data.get("referenceCount") or 0,
-            url=data.get("url") or f"https://doi.org/{doi}" if doi else "",
+            url=data.get("url") or (f"https://doi.org/{doi}" if doi else ""),
             source=self.name,
+            identifiers=PaperIdentifiers(doi=normalize_doi(doi), semantic_scholar_id=data.get("paperId") or "", arxiv_id=normalize_arxiv(ext.get("ArXiv")), pmid=str(ext.get("PubMed") or "")),
         )
 
     def _batch_get(self, paper_ids: list[str], fields: str = S2_PAPER_FIELDS) -> list[dict]:
@@ -121,41 +322,35 @@ class SemanticScholarSource(BaseSource):
                 results.extend(cached)
                 continue
             try:
-                resp = self._session.post(
+                resp = self._request("POST",
                     f"{S2_BASE}/paper/batch",
                     params={"fields": fields},
                     json={"ids": chunk},
                     timeout=30,
                 )
-                if resp.status_code == 429:
-                    time.sleep(5)
-                    resp = self._session.post(
-                        f"{S2_BASE}/paper/batch",
-                        params={"fields": fields},
-                        json={"ids": chunk},
-                        timeout=30,
-                    )
-                resp.raise_for_status()
+                raise_for_data(resp, "semantic_scholar")
                 chunk_results = resp.json()
                 self._cache_set(chunk_results, "s2_batch", *chunk)
                 results.extend(chunk_results)
             except Exception as e:
-                logger.warning("S2 batch fetch failed for chunk: %s", e)
+                log_source_failure(e, "semantic_scholar", "batch")
             time.sleep(0.5)
         return results
 
     def search_papers(
-        self, query: str, limit: int = 50, year_from: int = 2000, year_to: int = 2026
+        self, query: str, limit: int = 50, year_from: int = 1900, year_to: int | None = None
     ) -> list[Paper]:
+        year_to = resolve_year_to(year_to)
         cached = self._cached("s2_search", query, str(limit), str(year_from), str(year_to))
         if cached is not None:
             return [self._paper_from_s2(d) for d in cached]
 
         papers = []
         offset = 0
+        complete = True
         while len(papers) < limit:
             try:
-                resp = self._session.get(
+                resp = self._request("GET",
                     f"{S2_BASE}/paper/search",
                     params={
                         "query": query,
@@ -166,10 +361,7 @@ class SemanticScholarSource(BaseSource):
                     },
                     timeout=30,
                 )
-                if resp.status_code == 429:
-                    time.sleep(5)
-                    continue
-                resp.raise_for_status()
+                raise_for_data(resp, "semantic_scholar")
                 data = resp.json().get("data") or []
                 if not data:
                     break
@@ -179,19 +371,20 @@ class SemanticScholarSource(BaseSource):
                 offset += len(data)
                 time.sleep(1.0)
             except Exception as e:
-                logger.warning("S2 search failed: %s", e)
+                complete = False
+                log_source_failure(e, "semantic_scholar", "search")
                 break
 
-        if papers:
+        if complete:
             cache_data = [{
-                "paperId": p.id if not p.doi else "",
+                "paperId": p.identifiers.semantic_scholar_id or (p.id if not p.doi else ""),
                 "title": p.title,
                 "abstract": p.abstract,
                 "authors": [{"name": a.name, "authorId": a.author_id} for a in p.authors],
                 "year": p.year,
                 "citationCount": p.citation_count,
                 "referenceCount": p.reference_count,
-                "externalIds": {"DOI": p.doi},
+                "externalIds": {"DOI": p.doi, "ArXiv": p.identifiers.arxiv_id, "PubMed": p.identifiers.pmid},
                 "journal": {"name": p.venue},
                 "url": p.url,
                 "publicationVenue": {"name": p.venue} if p.venue else None,
@@ -205,30 +398,21 @@ class SemanticScholarSource(BaseSource):
             return self._paper_from_s2(cached)
 
         # Support DOI lookup
-        url = f"{S2_BASE}/paper/{paper_id}"
-        if paper_id.startswith("10."):
-            url = f"{S2_BASE}/paper/DOI:{paper_id}"
+        url = f"{S2_BASE}/paper/{s2_paper_id(paper_id)}"
         try:
-            resp = self._session.get(
+            resp = self._request("GET",
                 url,
                 params={"fields": S2_PAPER_FIELDS},
                 timeout=30,
             )
             if resp.status_code == 404:
                 return None
-            if resp.status_code == 429:
-                time.sleep(5)
-                resp = self._session.get(
-                    url,
-                    params={"fields": S2_PAPER_FIELDS},
-                    timeout=30,
-                )
-            resp.raise_for_status()
+            raise_for_data(resp, "semantic_scholar")
             data = resp.json()
             self._cache_set(data, "s2_paper", paper_id)
             return self._paper_from_s2(data)
         except Exception as e:
-            logger.warning("S2 get_paper(%s): %s", paper_id, e)
+            log_source_failure(e, "semantic_scholar", f"get_paper({paper_id})")
             return None
 
     def get_citations(self, paper_id: str, limit: int = 100) -> list[Paper]:
@@ -238,10 +422,12 @@ class SemanticScholarSource(BaseSource):
 
         papers = []
         offset = 0
-        url_base = f"{S2_BASE}/paper/{paper_id}/citations"
+        url_base = f"{S2_BASE}/paper/{s2_paper_id(paper_id)}/citations"
+        raw_records = []
+        complete = True
         while len(papers) < limit:
             try:
-                resp = self._session.get(
+                resp = self._request("GET",
                     url_base,
                     params={
                         "limit": min(500, limit - len(papers)),
@@ -250,23 +436,26 @@ class SemanticScholarSource(BaseSource):
                     },
                     timeout=30,
                 )
-                if resp.status_code == 429:
-                    time.sleep(5)
-                    continue
                 if resp.status_code == 404:
+                    complete = False
                     break
-                resp.raise_for_status()
+                raise_for_data(resp, "semantic_scholar")
                 data = resp.json().get("data") or []
                 if not data:
                     break
                 for d in data:
-                    cp = d.get("citingPaper") or d
-                    papers.append(self._paper_from_s2(cp))
+                    cp = d.get("citingPaper", d)
+                    if cp:
+                        raw_records.append(d)
+                        papers.append(self._paper_from_s2(cp))
                 offset += len(data)
                 time.sleep(0.5)
             except Exception as e:
-                logger.warning("S2 citations(%s): %s", paper_id, e)
+                complete = False
+                log_source_failure(e, "semantic_scholar", f"citations({paper_id})")
                 break
+        if complete:
+            self._cache_set(raw_records, "s2_citations", paper_id, str(limit))
         return papers
 
     def get_references(self, paper_id: str, limit: int = 100) -> list[Paper]:
@@ -276,10 +465,12 @@ class SemanticScholarSource(BaseSource):
 
         papers = []
         offset = 0
-        url_base = f"{S2_BASE}/paper/{paper_id}/references"
+        url_base = f"{S2_BASE}/paper/{s2_paper_id(paper_id)}/references"
+        raw_records = []
+        complete = True
         while len(papers) < limit:
             try:
-                resp = self._session.get(
+                resp = self._request("GET",
                     url_base,
                     params={
                         "limit": min(500, limit - len(papers)),
@@ -288,23 +479,26 @@ class SemanticScholarSource(BaseSource):
                     },
                     timeout=30,
                 )
-                if resp.status_code == 429:
-                    time.sleep(5)
-                    continue
                 if resp.status_code == 404:
+                    complete = False
                     break
-                resp.raise_for_status()
+                raise_for_data(resp, "semantic_scholar")
                 data = resp.json().get("data") or []
                 if not data:
                     break
                 for d in data:
-                    rp = d.get("citedPaper") or d
-                    papers.append(self._paper_from_s2(rp))
+                    rp = d.get("citedPaper", d)
+                    if rp:
+                        raw_records.append(d)
+                        papers.append(self._paper_from_s2(rp))
                 offset += len(data)
                 time.sleep(0.5)
             except Exception as e:
-                logger.warning("S2 references(%s): %s", paper_id, e)
+                complete = False
+                log_source_failure(e, "semantic_scholar", f"references({paper_id})")
                 break
+        if complete:
+            self._cache_set(raw_records, "s2_references", paper_id, str(limit))
         return papers
 
     def resolve_doi(self, doi: str) -> Paper | None:
@@ -318,13 +512,27 @@ class SemanticScholarSource(BaseSource):
 OA_BASE = "https://api.openalex.org"
 
 
+class _OpenAlexAuth(requests.auth.AuthBase):
+    def __call__(self, request):
+        if key := openalex_api_key():
+            request.headers["Authorization"] = f"Bearer {key}"
+        else:
+            request.headers.pop("Authorization", None)
+        return request
+
+
 class OpenAlexSource(BaseSource):
     """OpenAlex API client — used as fallback for S2 coverage gaps."""
 
     name = "openalex"
 
+    def __init__(self, cache: Cache | None = None):
+        super().__init__(cache)
+        # Bearer auth avoids placing the key in URLs and exception messages.
+        self._session.auth = _OpenAlexAuth()
+
     def _paper_from_oa(self, data: dict) -> Paper:
-        doi = data.get("doi", "").replace("https://doi.org/", "")
+        doi = (data.get("doi") or "").replace("https://doi.org/", "")
         paper_id = doi or data.get("id", "")
         authors = [
             Author(
@@ -336,6 +544,9 @@ class OpenAlexSource(BaseSource):
         venue = ""
         if data.get("primary_location") and data["primary_location"].get("source"):
             venue = data["primary_location"]["source"].get("display_name", "")
+        # OpenAlex no longer exposes a plain `abstract` field (selecting it
+        # makes the whole request fail) — rebuild it from the inverted index.
+        abstract = data.get("abstract") or _reconstruct_abstract(data)
         topics = [
             t.get("display_name", "")
             for t in (data.get("topics") or [])
@@ -345,8 +556,8 @@ class OpenAlexSource(BaseSource):
         ref_ids = [r.split("/")[-1] for r in (data.get("referenced_works") or [])]
         return Paper(
             id=paper_id,
-            title=data.get("title") or "",
-            abstract=data.get("abstract") or "",
+            title=data.get("title") or data.get("display_name") or "",
+            abstract=abstract,
             authors=authors,
             year=data.get("publication_year"),
             venue=venue,
@@ -354,20 +565,23 @@ class OpenAlexSource(BaseSource):
             citation_count=data.get("cited_by_count") or 0,
             reference_count=data.get("referenced_works_count") or 0,
             reference_ids=ref_ids,
-            url=data.get("doi") or "",
+            url=data.get("doi") or (data.get("primary_location") or {}).get("landing_page_url") or data.get("id") or "",
             source=self.name,
             topics=topics,
+            identifiers=PaperIdentifiers(doi=normalize_doi(doi), openalex_id=normalize_openalex(data.get("id"))),
         )
 
     def search_papers(
-        self, query: str, limit: int = 50, year_from: int = 2000, year_to: int = 2026
+        self, query: str, limit: int = 50, year_from: int = 1900, year_to: int | None = None
     ) -> list[Paper]:
+        year_to = resolve_year_to(year_to)
         cached = self._cached("oa_search", query, str(limit), str(year_from), str(year_to))
         if cached is not None:
             return [self._paper_from_oa(d) for d in cached]
 
         papers = []
         page = 1
+        complete = True
         while len(papers) < limit:
             try:
                 resp = self._session.get(
@@ -377,16 +591,11 @@ class OpenAlexSource(BaseSource):
                         "per_page": min(200, limit - len(papers)),
                         "page": page,
                         "filter": f"publication_year:{year_from}-{year_to}",
-                        "sort": "cited_by_count:desc",
-                        "select": (
-                            "id,doi,title,abstract,authorships,publication_year,"
-                            "cited_by_count,referenced_works_count,referenced_works,"
-                            "primary_location,topics,publication_date"
-                        ),
+                        "select": OA_SELECT,
                     },
                     timeout=30,
                 )
-                resp.raise_for_status()
+                raise_for_data(resp, "openalex")
                 data = resp.json()
                 results = data.get("results") or []
                 if not results:
@@ -396,11 +605,39 @@ class OpenAlexSource(BaseSource):
                 page += 1
                 time.sleep(0.3)
             except Exception as e:
-                logger.warning("OA search failed: %s", e)
+                complete = False
+                log_source_failure(e, "openalex", "search")
                 break
+        if complete:
+            self._cache_set(
+                [self._oa_to_dict(p) for p in papers],
+                "oa_search", query, str(limit), str(year_from), str(year_to),
+            )
         return papers
 
+    @staticmethod
+    def _oa_to_dict(paper: Paper) -> dict:
+        """Minimal serialisable view of a Paper (for the disk cache)."""
+        return {
+            "id": f"https://openalex.org/{paper.identifiers.openalex_id}" if paper.identifiers.openalex_id else paper.id,
+            "doi": f"https://doi.org/{paper.doi}" if paper.doi else None,
+            "title": paper.title,
+            "abstract": paper.abstract,
+            "authorships": [{"author": {"display_name": a.name, "id": a.author_id}}
+                            for a in paper.authors],
+            "publication_year": paper.year,
+            "cited_by_count": paper.citation_count,
+            "referenced_works_count": paper.reference_count,
+            "referenced_works": [
+                f"https://openalex.org/{r}" if not r.startswith("http") else r
+                for r in paper.reference_ids
+            ],
+            "primary_location": {"source": {"display_name": paper.venue}} if paper.venue else None,
+            "topics": [{"display_name": t} for t in paper.topics],
+        }
+
     def get_paper(self, paper_id: str) -> Paper | None:
+        paper_id = normalize_doi(paper_id) or normalize_openalex(paper_id) or paper_id
         cached = self._cached("oa_paper", paper_id)
         if cached is not None:
             return self._paper_from_oa(cached)
@@ -412,12 +649,12 @@ class OpenAlexSource(BaseSource):
             resp = self._session.get(url, timeout=30)
             if resp.status_code == 404:
                 return None
-            resp.raise_for_status()
+            raise_for_data(resp, "openalex")
             data = resp.json()
             self._cache_set(data, "oa_paper", paper_id)
             return self._paper_from_oa(data)
         except Exception as e:
-            logger.warning("OA get_paper(%s): %s", paper_id, e)
+            log_source_failure(e, "openalex", f"get_paper({paper_id})")
             return None
 
     def get_citations(self, paper_id: str, limit: int = 100) -> list[Paper]:
@@ -427,9 +664,11 @@ class OpenAlexSource(BaseSource):
 
         papers = []
         page = 1
-        oa_id = paper_id
-        if oa_id.startswith("10."):
-            oa_id = f"https://openalex.org/works?filter=doi:{paper_id}"
+        # OpenAlex' `cites:` filter only accepts an OpenAlex ID (W…), not a
+        # DOI — resolve DOIs first, otherwise every lookup returns an error.
+        oa_id = self._resolve_oa_id(paper_id)
+        if not oa_id:
+            return []
         while len(papers) < limit:
             try:
                 resp = self._session.get(
@@ -438,14 +677,11 @@ class OpenAlexSource(BaseSource):
                         "filter": f"cites:{oa_id}",
                         "per_page": min(200, limit - len(papers)),
                         "page": page,
-                        "select": (
-                            "id,doi,title,abstract,authorships,publication_year,"
-                            "cited_by_count,primary_location,topics"
-                        ),
+                        "select": OA_SELECT_MIN,
                     },
                     timeout=30,
                 )
-                resp.raise_for_status()
+                raise_for_data(resp, "openalex")
                 data = resp.json()
                 results = data.get("results") or []
                 if not results:
@@ -455,9 +691,32 @@ class OpenAlexSource(BaseSource):
                 page += 1
                 time.sleep(0.3)
             except Exception as e:
-                logger.warning("OA citations(%s): %s", paper_id, e)
+                log_source_failure(e, "openalex", f"citations({paper_id})")
                 break
+        if papers:
+            self._cache_set(
+                [self._oa_to_dict(p) for p in papers], "oa_citations", paper_id, str(limit)
+            )
         return papers
+
+    def _resolve_oa_id(self, paper_id: str) -> str:
+        """Return the short OpenAlex ID (W…) for an OpenAlex ID or a DOI."""
+        if oa_id := normalize_openalex(paper_id):
+            return oa_id
+        if doi := normalize_doi(paper_id):
+            try:
+                resp = self._session.get(
+                    f"{OA_BASE}/works/https://doi.org/{doi}",
+                    params={"select": "id"},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    return normalize_openalex(resp.json().get("id"))
+                if resp.status_code != 404:
+                    raise_for_data(resp, "openalex", "resolve_id")
+            except Exception as e:
+                log_source_failure(e, "openalex", f"resolve_id({paper_id})")
+        return ""
 
     def get_references(self, paper_id: str, limit: int = 100) -> list[Paper]:
         paper = self.get_paper(paper_id)
@@ -471,21 +730,18 @@ class OpenAlexSource(BaseSource):
                 resp = self._session.get(
                     f"{OA_BASE}/works",
                     params={
-                        "filter": f"openalex_id:{'|'.join(chunk)}",
+                        "filter": f"ids.openalex:{'|'.join(chunk)}",
                         "per_page": 200,
-                        "select": (
-                            "id,doi,title,abstract,authorships,publication_year,"
-                            "cited_by_count,primary_location,topics"
-                        ),
+                        "select": OA_SELECT_MIN,
                     },
                     timeout=30,
                 )
-                resp.raise_for_status()
+                raise_for_data(resp, "openalex")
                 for d in resp.json().get("results") or []:
                     papers.append(self._paper_from_oa(d))
                 time.sleep(0.3)
             except Exception as e:
-                logger.warning("OA references batch: %s", e)
+                log_source_failure(e, "openalex", "references_batch")
         return papers
 
     def resolve_doi(self, doi: str) -> Paper | None:
@@ -532,9 +788,11 @@ class CrossrefSource(BaseSource):
             reference_count=msg.get("references-count") or 0,
             url=f"https://doi.org/{doi}",
             source=self.name,
+            identifiers=PaperIdentifiers(doi=normalize_doi(doi)),
         )
 
-    def search_papers(self, query, limit=50, year_from=2000, year_to=2026):
+    def search_papers(self, query, limit=50, year_from=1900, year_to=None):
+        year_to = resolve_year_to(year_to)
         cached = self._cached("cr_search", query, str(limit), str(year_from), str(year_to))
         if cached is not None:
             return [self._paper_from_cr(d) for d in cached]
@@ -552,11 +810,11 @@ class CrossrefSource(BaseSource):
                 },
                 timeout=30,
             )
-            resp.raise_for_status()
+            raise_for_data(resp, "crossref")
             items = resp.json().get("message", {}).get("items") or []
             papers = [self._paper_from_cr(item) for item in items[:limit]]
         except Exception as e:
-            logger.warning("CR search failed: %s", e)
+            log_source_failure(e, "crossref", "search")
         return papers
 
     def get_paper(self, paper_id: str) -> Paper | None:
@@ -567,12 +825,12 @@ class CrossrefSource(BaseSource):
             resp = self._session.get(f"{CR_BASE}/works/{paper_id}", timeout=30)
             if resp.status_code == 404:
                 return None
-            resp.raise_for_status()
+            raise_for_data(resp, "crossref")
             data = resp.json()
             self._cache_set(data, "cr_paper", paper_id)
             return self._paper_from_cr(data)
         except Exception as e:
-            logger.warning("CR get_paper(%s): %s", paper_id, e)
+            log_source_failure(e, "crossref", f"get_paper({paper_id})")
             return None
 
     def get_citations(self, paper_id, limit=100):
@@ -607,7 +865,6 @@ class ArxivSource(BaseSource):
 
     def _paper_from_arxiv(self, entry) -> Paper:
         """Parse an arXiv Atom XML entry into a Paper."""
-        from xml.etree import ElementTree as ET
 
         ns = {
             "atom": "http://www.w3.org/2005/Atom",
@@ -659,48 +916,57 @@ class ArxivSource(BaseSource):
             url=f"https://arxiv.org/pdf/{arxiv_id}.pdf",
             source=self.name,
             topics=categories,
+            identifiers=PaperIdentifiers(doi=normalize_doi(doi), arxiv_id=normalize_arxiv(arxiv_id)),
         )
 
     def search_papers(
-        self, query: str, limit: int = 50, year_from: int = 2000, year_to: int = 2026
+        self, query: str, limit: int = 50, year_from: int = 1900, year_to: int | None = None
     ) -> list[Paper]:
-        import urllib.parse
         from xml.etree import ElementTree as ET
 
-        cached = self._cached("arxiv_search", query, str(limit))
+        year_to = resolve_year_to(year_to)
+        if limit <= 0 or not query.strip():
+            return []
+        if year_from > year_to:
+            raise ValueError("Start year must not exceed end year")
+        cache_args = (query, str(limit), str(year_from), str(year_to))
+        cached = self._cached("arxiv_search", *cache_args)
         if cached is not None:
             return [self._paper_from_arxiv(ET.fromstring(d)) for d in cached]
 
-        papers = []
-        max_results = min(limit, 100)
-        encoded_query = urllib.parse.quote(query)
-        url = (
-            f"{ARXIV_BASE}/query?"
-            f"search_query=all:{encoded_query}&"
-            f"start=0&"
-            f"max_results={max_results}&"
-            f"sortBy=submittedDate&"
-            f"sortOrder=descending"
-        )
-
-        try:
-            resp = self._session.get(url, timeout=30)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.text)
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            entries = root.findall("atom:entry", ns)
-
-            # Cache raw XML strings
-            raw_entries = []
-            for entry in entries:
-                raw_entries.append(ET.tostring(entry, encoding="unicode"))
-                papers.append(self._paper_from_arxiv(entry))
-            if raw_entries:
-                self._cache_set(raw_entries, "arxiv_search", query, str(limit))
-        except Exception as e:
-            logger.warning("arXiv search failed: %s", e)
-
-        return papers
+        expression = query if re.search(r"\b(?:all|ti|au|abs|cat|id):", query) else f"all:({query})"
+        expression += f" AND submittedDate:[{year_from}01010000 TO {year_to}12312359]"
+        papers, raw_entries = [], []
+        start = 0
+        complete = True
+        while len(papers) < limit:
+            page_size = min(100, limit - len(papers))
+            try:
+                if start:
+                    time.sleep(3)
+                resp = self._session.get(
+                    f"{ARXIV_BASE}/query",
+                    params={"search_query": expression, "start": start, "max_results": page_size,
+                            "sortBy": "relevance", "sortOrder": "descending"},
+                    timeout=30,
+                )
+                raise_for_data(resp, "arxiv", "search")
+                entries = ET.fromstring(resp.text).findall("{http://www.w3.org/2005/Atom}entry")
+                for entry in entries:
+                    paper = self._paper_from_arxiv(entry)
+                    if paper.year is not None and year_from <= paper.year <= year_to:
+                        raw_entries.append(ET.tostring(entry, encoding="unicode"))
+                        papers.append(paper)
+                start += len(entries)
+                if len(entries) < page_size:
+                    break
+            except Exception as e:
+                complete = False
+                log_source_failure(e, "arxiv", "search")
+                break
+        if complete:
+            self._cache_set(raw_entries, "arxiv_search", *cache_args)
+        return papers[:limit]
 
     def get_paper(self, paper_id: str) -> Paper | None:
         import urllib.parse
@@ -714,7 +980,7 @@ class ArxivSource(BaseSource):
         url = f"{ARXIV_BASE}/query?id_list={encoded_id}&max_results=1"
         try:
             resp = self._session.get(url, timeout=30)
-            resp.raise_for_status()
+            raise_for_data(resp, "arxiv")
             root = ET.fromstring(resp.text)
             ns = {"atom": "http://www.w3.org/2005/Atom"}
             entry = root.find("atom:entry", ns)
@@ -723,7 +989,7 @@ class ArxivSource(BaseSource):
                 self._cache_set(raw, "arxiv_paper", paper_id)
                 return self._paper_from_arxiv(entry)
         except Exception as e:
-            logger.warning("arXiv get_paper(%s): %s", paper_id, e)
+            log_source_failure(e, "arxiv", f"get_paper({paper_id})")
         return None
 
     def get_citations(self, paper_id: str, limit: int = 100) -> list[Paper]:
@@ -808,18 +1074,28 @@ class ImpactFactorLookup:
                         self._cache.set(est_if, "if_lookup", key)
                     self._if_cache[key] = est_if
                     return est_if
-        except Exception:
-            pass
+        except Exception as e:
+            # Impact factor is a display-only nicety, so a failure here must
+            # not pollute diagnostics with noise that hides real problems.
+            # It is logged at debug rather than silently dropped.
+            logger.debug("IF lookup failed for %s: %s", key, e)
 
         self._if_cache[key] = None
         return None
 
     def get_if_display(self, venue: str, issn: str = "") -> str:
-        """Get IF as a display string, e.g. 'IF: 8.3' or 'IF: N/A'."""
+        """Get IF as a display string, e.g. 'IF: 8.3' or 'IF: N/A'.
+
+        Values not present in the JCR table are *estimates* derived from
+        OpenAlex citation/h-index stats and are prefixed with '~' so they are
+        never mistaken for real JCR impact factors.
+        """
         val = self.get_if(venue, issn)
-        if val is not None:
+        if val is None:
+            return "IF: N/A"
+        if (venue or "").lower().strip() in _HARDCODED_IF:
             return f"IF: {val:.1f}"
-        return "IF: N/A"
+        return f"IF: ~{val:.1f} (est.)"
 
 
 # Hardcoded IF lookup for common journals (JCR 2023)
@@ -965,67 +1241,109 @@ class SourceManager:
         return self._cache
 
     def search_papers(
-        self, query: str, limit: int = 50, year_from: int = 2000, year_to: int = 2026,
+        self, query: str, limit: int = 50, year_from: int = 1900, year_to: int | None = None,
         include_preprints: bool = True,
     ) -> list[Paper]:
-        papers = self.s2.search_papers(query, limit, year_from, year_to)
+        year_to = resolve_year_to(year_to)
+        try:
+            papers = self.s2.search_papers(query, limit, year_from, year_to)
+        except Exception as e:
+            log_source_failure(e, "semantic_scholar", "manager.search")
+            papers = []
         if not papers:
-            papers = self.oa.search_papers(query, limit, year_from, year_to)
+            # Falling through to OpenAlex is not a silent convenience: the S2
+            # failure (if any) is already in diagnostics, so the user can see
+            # that these results came from a fallback rather than a primary.
+            try:
+                papers = self.oa.search_papers(query, limit, year_from, year_to)
+            except Exception as e:
+                log_source_failure(e, "openalex", "manager.search")
+                papers = []
         if include_preprints:
             try:
-                arxiv_papers = self.arxiv.search_papers(query, limit=limit // 3)
+                arxiv_papers = self.arxiv.search_papers(query, limit=max(1, limit // 3), year_from=year_from, year_to=year_to)
                 papers.extend(arxiv_papers)
-            except Exception:
-                pass
+            except Exception as e:
+                log_source_failure(e, "arxiv", "manager.search")
         return papers
 
     def search_all_sources(
-        self, query: str, limit: int = 200, year_from: int = 1900, year_to: int = 2026,
+        self, query: str, limit: int = 200, year_from: int = 1900, year_to: int | None = None,
     ) -> list[Paper]:
-        """Search across ALL sources and merge results. For comprehensive mode."""
+        """Return observations from each provider; merge metadata downstream."""
+        year_to = resolve_year_to(year_to)
+        if limit <= 0 or not query.strip():
+            return []
         all_papers: list[Paper] = []
-        seen: set[str] = set()
-
-        def add(papers):
-            for p in papers:
-                key = (p.doi or p.id).lower()
-                if key not in seen:
-                    seen.add(key)
-                    all_papers.append(p)
-
-        # S2 (primary, broadest coverage)
-        add(self.s2.search_papers(query, limit=limit, year_from=year_from, year_to=year_to))
-        # OpenAlex (deeper, different ranking)
-        add(self.oa.search_papers(query, limit=limit // 2, year_from=year_from, year_to=year_to))
-        # arXiv (preprints)
-        add(self.arxiv.search_papers(query, limit=limit // 4, year_from=year_from, year_to=year_to))
-
+        provider_counts = {}
+        for source, size in ((self.s2, limit), (self.oa, max(1, limit // 2)), (self.arxiv, max(1, limit // 4))):
+            try:
+                papers = source.search_papers(query, limit=size, year_from=year_from, year_to=year_to)
+            except Exception as e:
+                log_source_failure(e, source.name, "manager.search_all")
+                papers = []
+            provider_counts[source.name] = len(papers)
+            for paper in papers:
+                paper.discovery_traces.append(DiscoveryTrace(method="keyword", provider=source.name, query=query))
+            all_papers.extend(papers)
+        self.last_search_manifest = {
+            "query": query, "year_from": year_from, "year_to": year_to,
+            "requested_limit": limit, "provider_counts": provider_counts,
+            "raw_count": len(all_papers), "crossref_role": "metadata_resolution",
+            "diagnostics": [{"source": e.source, "kind": e.kind.value, "message": e.message} for e in get_diagnostics().events],
+        }
         return all_papers
 
-    def get_paper(self, paper_id: str) -> Paper | None:
-        paper = self.s2.get_paper(paper_id)
-        if paper is None:
-            paper = self.oa.get_paper(paper_id)
-        if paper is None and paper_id.startswith("10."):
-            paper = self.cr.get_paper(paper_id)
-        return paper
+    def _routes(self, paper: str | Paper):
+        """Only send an ID to providers whose identifier contract accepts it."""
+        value = paper.id if isinstance(paper, Paper) else paper
+        ids = paper.identifiers if isinstance(paper, Paper) else PaperIdentifiers()
+        doi = normalize_doi((paper.doi if isinstance(paper, Paper) else "") or ids.doi or value)
+        oa = normalize_openalex(ids.openalex_id or value.removeprefix("openalex:"))
+        ax = normalize_arxiv(ids.arxiv_id or value)
+        s2 = ids.semantic_scholar_id
+        if value.lower().startswith("s2:"):
+            s2 = value[3:]
+        if not s2 and not (doi or oa or ax):
+            s2 = value
+        routes = []
+        if s2 or doi or ax:
+            routes.append((self.s2, s2 or doi or f"ARXIV:{ax}"))
+        if oa or doi:
+            routes.append((self.oa, oa or doi))
+        if doi:
+            routes.append((self.cr, doi))
+        if ax:
+            routes.append((self.arxiv, ax))
+        return routes
 
-    def get_citations(self, paper_id: str, limit: int = 100) -> list[Paper]:
-        papers = self.s2.get_citations(paper_id, limit)
-        if not papers:
-            papers = self.oa.get_citations(paper_id, limit)
-        return papers
+    def get_paper(self, paper_id: str | Paper) -> Paper | None:
+        for source, pid in self._routes(paper_id):
+            try:
+                paper = source.get_paper(pid)
+                if paper is not None:
+                    return paper
+            except Exception as e:
+                log_source_failure(e, source.name, "manager.get_paper")
+        return None
 
-    def get_references(self, paper_id: str, limit: int = 100) -> list[Paper]:
-        papers = self.s2.get_references(paper_id, limit)
-        if not papers:
-            papers = self.oa.get_references(paper_id, limit)
-        return papers
+    def _get_related(self, paper: str | Paper, method: str, limit: int) -> list[Paper]:
+        for source, pid in self._routes(paper):
+            if source not in (self.s2, self.oa):
+                continue
+            try:
+                papers = getattr(source, method)(pid, limit)
+                if papers:
+                    return papers
+            except Exception as e:
+                log_source_failure(e, source.name, f"manager.{method}")
+        return []
+
+    def get_citations(self, paper_id: str | Paper, limit: int = 100) -> list[Paper]:
+        return self._get_related(paper_id, "get_citations", limit)
+
+    def get_references(self, paper_id: str | Paper, limit: int = 100) -> list[Paper]:
+        return self._get_related(paper_id, "get_references", limit)
 
     def resolve_doi(self, doi: str) -> Paper | None:
-        paper = self.s2.resolve_doi(doi)
-        if paper is None:
-            paper = self.oa.resolve_doi(doi)
-        if paper is None:
-            paper = self.cr.resolve_doi(doi)
-        return paper
+        return self.get_paper(normalize_doi(doi)) if normalize_doi(doi) else None

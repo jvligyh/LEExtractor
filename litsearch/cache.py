@@ -5,6 +5,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+CACHE_SCHEMA_VERSION = 3
+
 
 class Cache:
     """Persistent key-value cache with TTL (default 24 hours)."""
@@ -28,7 +30,7 @@ class Cache:
             conn.commit()
 
     def _make_key(self, *parts: str) -> str:
-        return "|".join(parts)
+        return json.dumps([CACHE_SCHEMA_VERSION, *parts], ensure_ascii=False)
 
     def get(self, *key_parts: str):
         key = self._make_key(*key_parts)

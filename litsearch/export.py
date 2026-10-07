@@ -1,8 +1,9 @@
 """Export search results in various formats: CSV, JSON, RIS, Mermaid."""
 
 import csv
-import json
+import hashlib
 import io
+import json
 
 from litsearch.models import Paper, SearchResult
 
@@ -16,15 +17,13 @@ def to_csv(papers: list[Paper], include_abstract: bool = False) -> str:
         header.append("Abstract")
     writer.writerow(header)
     for p in papers:
-        authors = "; ".join(a.name for a in p.authors[:5])
-        if len(p.authors) > 5:
-            authors += " et al."
+        authors = "; ".join(a.name for a in p.authors)
         row = [
             p.title, authors, p.year or "", p.venue or "",
             p.doi or "", p.citation_count, round(p.relevance_score, 4),
         ]
         if include_abstract:
-            row.append((p.abstract or "")[:300])
+            row.append(p.abstract or "")
         writer.writerow(row)
     return output.getvalue()
 
@@ -99,7 +98,7 @@ def to_ris(papers: list[Paper]) -> str:
         parts.append("TY  - JOUR")
         parts.append(f"TI  - {p.title}")
         if p.authors:
-            for a in p.authors[:10]:
+            for a in p.authors:
                 parts.append(f"AU  - {a.name}")
         if p.year:
             parts.append(f"PY  - {p.year}")
@@ -111,7 +110,21 @@ def to_ris(papers: list[Paper]) -> str:
             parts.append(f"UR  - {p.url}")
         if p.abstract:
             # RIS has N2 for abstract
-            parts.append(f"N2  - {(p.abstract or '')[:500]}")
+            parts.append(f"N2  - {' '.join((p.abstract or '').splitlines())}")
         parts.append("ER  - ")
         entries.append("\n".join(parts))
+    return "\n\n".join(entries)
+
+
+def to_bibtex(papers: list[Paper]) -> str:
+    def escape(text):
+        return str(text).replace("\\", r"\textbackslash{}").replace("{", r"\{").replace("}", r"\}").replace("%", r"\%").replace("&", r"\&").replace("_", r"\_").replace("#", r"\#")
+    entries = []
+    for p in papers:
+        key = "paper_" + hashlib.sha256(p.canonical_id.encode()).hexdigest()[:12]
+        fields = {"title": p.title, "author": " and ".join(a.name for a in p.authors),
+                  "year": p.year, "journal": p.venue, "doi": p.doi, "url": p.url, "abstract": p.abstract}
+        lines = [f"@article{{{key},"]
+        lines += [f"  {name} = {{{escape(value)}}}," for name, value in fields.items() if value]
+        entries.append("\n".join([*lines, "}"]))
     return "\n\n".join(entries)
